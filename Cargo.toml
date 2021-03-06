@@ -1,0 +1,16 @@
+[package]
+name = "rredis"
+version = "0.1.0"
+authors = ["Stephan Dollberg <stephan.dollberg@gmail.com>"]
+edition = "2018"
+
+
+[dependencies]
+io-uring = "0.5"
+redis-parser = "0.1.2"
+anyhow = "1"
+nix = "0.19"
+lazy_static = "1"
+socket2 = "0.3"
+slab = "0.4"
+libc = { version = "0.2", default-features = false }
