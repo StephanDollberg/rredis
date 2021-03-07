@@ -10,6 +10,7 @@ use io_uring::squeue::Flags;
 use crate::redis_handler::RedisHandler;
 use crate::redis_handler::HandleResult;
 use crate::reusable_slab_allocator::ReusableSlabAllocator;
+use std::collections::VecDeque;
 
 extern crate redis_protocol;
 
@@ -48,7 +49,7 @@ fn tag_is_timer(tag: usize) -> bool {
 pub struct Reactor {
     listener: TcpListener,
     timespec: Timespec,
-    backlog: Vec<io_uring::squeue::Entry>,
+    backlog: VecDeque<io_uring::squeue::Entry>,
     buf_alloc: ReusableSlabAllocator,
     token_alloc: Slab<Token>,
     redis: RedisHandler,
@@ -58,7 +59,7 @@ impl Reactor {
     pub fn new() -> anyhow::Result<Reactor> {
         let listener = TcpListener::bind(("127.0.0.1", 3456))?;
 
-        let backlog = Vec::new();
+        let backlog = VecDeque::new();
         let token_alloc = Slab::with_capacity(64);
 
         println!("listen {}", listener.local_addr()?);
@@ -87,7 +88,7 @@ impl Reactor {
         unsafe {
             if sq.push(&read_e).is_err() {
                 println!("failed to push read");
-                self.backlog.push(read_e);
+                self.backlog.push_back(read_e);
             }
         }
 
@@ -97,7 +98,7 @@ impl Reactor {
             .user_data(set_timer_on_key(token_index) as _);
         unsafe {
             if sq.push(&timeout_e).is_err() {
-                self.backlog.push(timeout_e);
+                self.backlog.push_back(timeout_e);
             }
         }
     }
@@ -112,7 +113,7 @@ impl Reactor {
 
         unsafe {
             if sq.push(&write_e).is_err() {
-                self.backlog.push(write_e);
+                self.backlog.push_back(write_e);
             }
         }
 
@@ -122,7 +123,7 @@ impl Reactor {
             .user_data(set_timer_on_key(token_index) as _);
         unsafe {
             if sq.push(&timeout_e).is_err() {
-                self.backlog.push(timeout_e);
+                self.backlog.push_back(timeout_e);
             }
         }
     }
@@ -140,40 +141,26 @@ impl Reactor {
             sq.push(&accept_e).expect("Couldn't push first accept to queue. Something is wrong");
         }
 
-        sq.sync();
 
         loop {
             println!("looping");
+            sq.sync();
+
             match submitter.submit_and_wait(1) {
                 Ok(_) => (),
                 Err(ref err) if err.raw_os_error() == Some(libc::EBUSY) => (),
                 Err(err) => return Err(err.into()),
             }
             cq.sync();
+
             println!("submitted");
 
-            let mut iter = self.backlog.drain(..);
 
-            // clean backlog
-            loop {
-                if sq.is_full() {
-                    match submitter.submit() {
-                        Ok(_) => (),
-                        Err(ref err) if err.raw_os_error() == Some(libc::EBUSY) => break,
-                        Err(err) => return Err(err.into()),
-                    }
-                }
-                sq.sync();
-
-                match iter.next() {
-                    Some(sqe) => unsafe {
-                        let _ = sq.push(&sqe);
-                    },
-                    None => break,
+            unsafe {
+                while !self.backlog.is_empty() && !sq.push(self.backlog.front().unwrap()).is_err() {
+                    self.backlog.pop_front();
                 }
             }
-
-            drop(iter);
 
             for cqe in &mut cq {
                 let ret = cqe.result();
@@ -216,12 +203,11 @@ impl Reactor {
                     Token::Read { fd, buf_index, offset } => {
                         if ret <= 0 {
                             eprintln!(
-                                "token {:?} ret {:?} error: {:?}",
+                                "closing token {:?} ret {:?} error: {:?}",
                                 self.token_alloc.get(token_index),
                                 ret,
                                 io::Error::from_raw_os_error(-ret)
                             );
-                            println!("shutdown");
 
                             self.buf_alloc.deallocate_buf(buf_index);
                             self.token_alloc.remove(token_index);
