@@ -7,6 +7,11 @@ use slab::Slab;
 use io_uring::types::Timespec;
 use io_uring::squeue::Flags;
 
+use crate::redis_handler::RedisHandler;
+use crate::redis_handler::HandleResult;
+use crate::reusable_slab_allocator::ReusableSlabAllocator;
+
+extern crate redis_protocol;
 
 #[derive(Clone, Debug)]
 enum Token {
@@ -44,9 +49,9 @@ pub struct Reactor {
     listener: TcpListener,
     timespec: Timespec,
     backlog: Vec<io_uring::squeue::Entry>,
-    bufpool: Vec<usize>,
-    buf_alloc: Slab<Box<[u8]>>,
+    buf_alloc: ReusableSlabAllocator,
     token_alloc: Slab<Token>,
+    redis: RedisHandler,
 }
 
 impl Reactor {
@@ -54,27 +59,26 @@ impl Reactor {
         let listener = TcpListener::bind(("127.0.0.1", 3456))?;
 
         let backlog = Vec::new();
-        let bufpool = Vec::with_capacity(64);
-        let buf_alloc = Slab::with_capacity(64);
         let token_alloc = Slab::with_capacity(64);
 
         println!("listen {}", listener.local_addr()?);
 
 
-        let timespec: Timespec = Timespec::new().sec(2).nsec(1000000);
+        let timespec: Timespec = Timespec::new().sec(300).nsec(1000000);
 
         return Ok(Reactor {
             listener,
-            timespec: timespec,
-            backlog: backlog,
-            bufpool: bufpool,
-            buf_alloc: buf_alloc,
-            token_alloc: token_alloc,
+            timespec,
+            backlog,
+            buf_alloc: ReusableSlabAllocator::new(),
+            token_alloc,
+            redis: RedisHandler::new(),
         })
     }
 
-    fn enqueue_read(&mut self, sq: &mut SubmissionQueue, token_index: usize, fd: RawFd, buf_index: usize) {
-        let buf = &mut self.buf_alloc[buf_index];
+    fn enqueue_read(&mut self, sq: &mut SubmissionQueue, token_index: usize, fd: RawFd,
+        buf_index: usize, offset: usize) {
+        let buf = &mut self.buf_alloc.index(buf_index)[offset..];
         let read_e = opcode::Recv::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as _)
             .build()
             .flags(Flags::IO_LINK)
@@ -100,7 +104,7 @@ impl Reactor {
 
     fn enqueue_write(&mut self, sq: &mut SubmissionQueue, fd: RawFd, token_index: usize,
                      buf_index: usize, offset: usize, len: usize) {
-        let buf = &self.buf_alloc[buf_index][offset..];
+        let buf = &self.buf_alloc.index(buf_index)[offset..];
         let write_e = opcode::Send::new(types::Fd(fd), buf.as_ptr(), len as _)
             .build()
             .flags(Flags::IO_LINK)
@@ -122,6 +126,7 @@ impl Reactor {
             }
         }
     }
+
 
     pub fn run(&mut self) -> anyhow::Result<()> {
         let mut ring = IoUring::new(256)?;
@@ -201,22 +206,12 @@ impl Reactor {
                         }
 
                         // enqueue read
+                        let buf_index = self.buf_alloc.allocate_buf();
+
                         let fd = ret;
-
-                        let buf_index = match self.bufpool.pop() {
-                            Some(buf_index) => buf_index,
-                            None => {
-                                let buf = vec![0u8; 2048].into_boxed_slice();
-                                let buf_entry = self.buf_alloc.vacant_entry();
-                                let buf_index = buf_entry.key();
-                                buf_entry.insert(buf);
-                                buf_index
-                            }
-                        };
-
                         let token_index = self.token_alloc.insert(Token::Read{ fd, buf_index, offset: 0 });
 
-                        self.enqueue_read(&mut sq, token_index, fd, buf_index);
+                        self.enqueue_read(&mut sq, token_index, fd, buf_index, 0);
                     }
                     Token::Read { fd, buf_index, offset } => {
                         if ret <= 0 {
@@ -228,7 +223,7 @@ impl Reactor {
                             );
                             println!("shutdown");
 
-                            self.bufpool.push(buf_index);
+                            self.buf_alloc.deallocate_buf(buf_index);
                             self.token_alloc.remove(token_index);
 
                             unsafe {
@@ -237,14 +232,40 @@ impl Reactor {
                         } else {
                             let len = ret as usize;
 
-                            *token = Token::Write {
-                                fd,
-                                buf_index,
-                                len,
-                                offset: 0,
-                            };
+                            match self.redis.handle_data(&mut self.buf_alloc, buf_index, offset + len)  {
+                                HandleResult::NotEnoughData => {
+                                    *token = Token::Read{
+                                        fd,
+                                        buf_index,
+                                        offset: offset + len,
+                                    };
 
-                            self.enqueue_write(&mut sq, fd, token_index, buf_index, 0, len);
+                                    self.enqueue_read(&mut sq, token_index, fd, buf_index, offset + len);
+                                },
+                                HandleResult::Processed((buf_index, bytes_consumed)) => {
+                                    // TODO: handle bytes_consumed
+
+                                    *token = Token::Write {
+                                        fd,
+                                        buf_index,
+                                        len: bytes_consumed,
+                                        offset: 0,
+                                    };
+
+                                    self.enqueue_write(&mut sq, fd, token_index, buf_index, 0, len);
+
+                                },
+                                HandleResult::Error => {
+                                    println!("Got redis protocol error, closing");
+
+                                    self.buf_alloc.deallocate_buf(buf_index);
+                                    self.token_alloc.remove(token_index);
+
+                                    unsafe {
+                                        libc::close(fd);
+                                    }
+                                }
+                            }
                         }
                     }
                     Token::Write {
@@ -262,7 +283,7 @@ impl Reactor {
                             );
                             println!("shutdown");
 
-                            self.bufpool.push(buf_index);
+                            self.buf_alloc.deallocate_buf(buf_index);
                             self.token_alloc.remove(token_index);
 
                             unsafe {
@@ -275,11 +296,10 @@ impl Reactor {
                                 // enqueue read
                                 *token = Token::Read { fd, buf_index, offset: 0 };
 
-                                self.enqueue_read(&mut sq, token_index, fd, buf_index)
+                                self.enqueue_read(&mut sq, token_index, fd, buf_index, offset)
                             } else {
                                 let offset = offset + write_len;
                                 let len = len - offset;
-
 
                                 *token = Token::Write {
                                     fd,
@@ -289,7 +309,6 @@ impl Reactor {
                                 };
 
                                 self.enqueue_write(&mut sq, fd, token_index, buf_index, offset, len);
-
                             };
                         }
                     }
