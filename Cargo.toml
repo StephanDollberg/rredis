@@ -7,7 +7,7 @@ edition = "2018"
 
 [dependencies]
 io-uring = "0.5"
-redis-parser = "0.1.2"
+redis-protocol = "1.0.0"
 anyhow = "1"
 nix = "0.19"
 lazy_static = "1"
