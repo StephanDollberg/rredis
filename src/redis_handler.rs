@@ -28,7 +28,6 @@ impl RedisHandler {
         };
 
         let buf_index = buf_alloc.allocate_buf();
-        buf_alloc.index(buf_index);
 
         match self.state.get(key) {
             Some(val) => {
@@ -62,7 +61,6 @@ impl RedisHandler {
         self.state.insert(key.to_vec(), value.to_vec());
 
         let buf_index = buf_alloc.allocate_buf();
-        buf_alloc.index(buf_index);
 
         redis_protocol::prelude::encode(&mut buf_alloc.index(buf_index),
                                         &redis_protocol::prelude::Frame::SimpleString(String::from("OK"))).unwrap();
@@ -74,7 +72,7 @@ impl RedisHandler {
         let command_handlers = HashMap::new();
 
         let mut handler = RedisHandler{
-            command_handlers: command_handlers,
+            command_handlers,
             state: HashMap::new(),
         };
 
