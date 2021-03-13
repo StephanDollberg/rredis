@@ -228,17 +228,17 @@ impl Reactor {
 
                                     self.enqueue_read(&mut sq, token_index, fd, buf_index, offset + len);
                                 },
-                                HandleResult::Processed((buf_index, bytes_consumed)) => {
+                                HandleResult::Processed((buf_index, bytes_written, _bytes_consumed)) => {
                                     // TODO: handle bytes_consumed
 
                                     *token = Token::Write {
                                         fd,
                                         buf_index,
-                                        len: bytes_consumed,
+                                        len: bytes_written,
                                         offset: 0,
                                     };
 
-                                    self.enqueue_write(&mut sq, fd, token_index, buf_index, 0, len);
+                                    self.enqueue_write(&mut sq, fd, token_index, buf_index, 0, bytes_written);
 
                                 },
                                 HandleResult::Error => {
