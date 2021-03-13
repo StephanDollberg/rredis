@@ -128,6 +128,47 @@ impl Reactor {
         }
     }
 
+    fn handle_data(&mut self, mut sq: &mut SubmissionQueue, fd: RawFd,
+                   token_index: usize, buf_index: usize, offset: usize, len: usize) {
+        match self.redis.handle_data(&mut self.buf_alloc, buf_index, offset + len)  {
+            HandleResult::NotEnoughData => {
+                self.token_alloc[token_index] = Token::Read{
+                    fd,
+                    buf_index,
+                    offset: offset + len,
+                };
+
+                self.enqueue_read(&mut sq, token_index, fd, buf_index, offset + len);
+            },
+            HandleResult::Processed((buf_index, bytes_written, bytes_consumed)) => {
+                // TODO: handle bytes_consumed
+
+                self.token_alloc[token_index] = Token::Write {
+                    fd,
+                    buf_index,
+                    len: bytes_written,
+                    offset: 0,
+                };
+
+                self.enqueue_write(&mut sq, fd, token_index, buf_index, 0, bytes_written);
+
+                if bytes_consumed < len {
+                    self.handle_data(sq, fd, token_index, buf_index, offset + bytes_consumed, len);
+                }
+            },
+            HandleResult::Error => {
+                println!("Got redis protocol error, closing");
+
+                self.buf_alloc.deallocate_buf(buf_index);
+                self.token_alloc.remove(token_index);
+
+                unsafe {
+                    libc::close(fd);
+                }
+            }
+        }
+
+    }
 
     pub fn run(&mut self) -> anyhow::Result<()> {
         let mut ring = IoUring::new(256)?;
@@ -218,40 +259,7 @@ impl Reactor {
                         } else {
                             let len = ret as usize;
 
-                            match self.redis.handle_data(&mut self.buf_alloc, buf_index, offset + len)  {
-                                HandleResult::NotEnoughData => {
-                                    *token = Token::Read{
-                                        fd,
-                                        buf_index,
-                                        offset: offset + len,
-                                    };
-
-                                    self.enqueue_read(&mut sq, token_index, fd, buf_index, offset + len);
-                                },
-                                HandleResult::Processed((buf_index, bytes_written, _bytes_consumed)) => {
-                                    // TODO: handle bytes_consumed
-
-                                    *token = Token::Write {
-                                        fd,
-                                        buf_index,
-                                        len: bytes_written,
-                                        offset: 0,
-                                    };
-
-                                    self.enqueue_write(&mut sq, fd, token_index, buf_index, 0, bytes_written);
-
-                                },
-                                HandleResult::Error => {
-                                    println!("Got redis protocol error, closing");
-
-                                    self.buf_alloc.deallocate_buf(buf_index);
-                                    self.token_alloc.remove(token_index);
-
-                                    unsafe {
-                                        libc::close(fd);
-                                    }
-                                }
-                            }
+                            self.handle_data(&mut sq, fd, token_index, buf_index, offset, len);
                         }
                     }
                     Token::Write {
