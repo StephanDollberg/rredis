@@ -68,6 +68,14 @@ impl RedisHandler {
         return HandleResult::Processed((buf_index, consumed));
     }
 
+    pub fn handle_command(&mut self, _args: &Vec<redis_protocol::prelude::Frame>, buf_alloc: &mut ReusableSlabAllocator, consumed: usize) -> HandleResult {
+        let buf_index = buf_alloc.allocate_buf();
+
+        redis_protocol::prelude::encode(&mut buf_alloc.index(buf_index), &redis_protocol::prelude::Frame::Array(Vec::new())).unwrap();
+
+        return HandleResult::Processed((buf_index, consumed));
+    }
+
     pub fn new() -> RedisHandler {
         let command_handlers = HashMap::new();
 
@@ -78,6 +86,7 @@ impl RedisHandler {
 
         handler.command_handlers.insert("GET".as_bytes().to_vec(), RedisHandler::handle_get);
         handler.command_handlers.insert("SET".as_bytes().to_vec(), RedisHandler::handle_set);
+        handler.command_handlers.insert("COMMAND".as_bytes().to_vec(), RedisHandler::handle_command);
 
         return handler;
     }
