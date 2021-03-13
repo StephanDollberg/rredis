@@ -9,22 +9,25 @@ use io_uring::squeue::Flags;
 
 use crate::redis_handler::RedisHandler;
 use crate::redis_handler::HandleResult;
-use crate::reusable_slab_allocator::ReusableSlabAllocator;
+use crate::reusable_slab_allocator::{ReusableSlabAllocator, BufferWrapper};
 use std::collections::VecDeque;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 extern crate redis_protocol;
 
 #[derive(Clone, Debug)]
 enum Token {
+    None, // only used for Rust not to annoy me
     Accept,
     Read {
         fd: RawFd,
-        buf_index: usize,
+        buf_wrap: BufferWrapper,
         offset: usize,
     },
     Write {
         fd: RawFd,
-        buf_index: usize,
+        buf_wrap: BufferWrapper,
         offset: usize,
         len: usize,
     },
@@ -78,88 +81,90 @@ impl Reactor {
     }
 
     fn enqueue_read(&mut self, sq: &mut SubmissionQueue, token_index: usize, fd: RawFd,
-        buf_index: usize, offset: usize) {
-        let buf = &mut self.buf_alloc.index(buf_index)[offset..];
-        let read_e = opcode::Recv::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as _)
-            .build()
-            .flags(Flags::IO_LINK)
-            .user_data(token_index as _);
+        buf_wrap: &mut BufferWrapper, offset: usize) {
+        buf_wrap.index(|buf: &mut Box<[u8]>| {
+            let mut buf = &mut buf[offset..];
+            let read_e = opcode::Recv::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as _)
+                .build()
+                .flags(Flags::IO_LINK)
+                .user_data(token_index as _);
 
-        unsafe {
-            if sq.push(&read_e).is_err() {
-                println!("failed to push read");
-                self.backlog.push_back(read_e);
+            unsafe {
+                if sq.push(&read_e).is_err() {
+                    println!("failed to push read");
+                    self.backlog.push_back(read_e);
+                }
             }
-        }
 
-        // link read timeout
-        let timeout_e = opcode::LinkTimeout::new(&self.timespec as *const Timespec)
-            .build()
-            .user_data(set_timer_on_key(token_index) as _);
-        unsafe {
-            if sq.push(&timeout_e).is_err() {
-                self.backlog.push_back(timeout_e);
+            // link read timeout
+            let timeout_e = opcode::LinkTimeout::new(&self.timespec as *const Timespec)
+                .build()
+                .user_data(set_timer_on_key(token_index) as _);
+            unsafe {
+                if sq.push(&timeout_e).is_err() {
+                    self.backlog.push_back(timeout_e);
+                }
             }
-        }
+        });
     }
 
     fn enqueue_write(&mut self, sq: &mut SubmissionQueue, fd: RawFd, token_index: usize,
-                     buf_index: usize, offset: usize, len: usize) {
-        let buf = &self.buf_alloc.index(buf_index)[offset..];
-        let write_e = opcode::Send::new(types::Fd(fd), buf.as_ptr(), len as _)
-            .build()
-            .flags(Flags::IO_LINK)
-            .user_data(token_index as _);
+                     buf_wrap: &BufferWrapper, offset: usize, len: usize) {
+        buf_wrap.index_non_mut(|buf: &Box<[u8]>| {
+            let buf = &buf[offset..];
+            let write_e = opcode::Send::new(types::Fd(fd), buf.as_ptr(), len as _)
+                .build()
+                .flags(Flags::IO_LINK)
+                .user_data(token_index as _);
 
-        unsafe {
-            if sq.push(&write_e).is_err() {
-                self.backlog.push_back(write_e);
+            unsafe {
+                if sq.push(&write_e).is_err() {
+                    self.backlog.push_back(write_e);
+                }
             }
-        }
 
-        // link write timeout
-        let timeout_e = opcode::LinkTimeout::new(&self.timespec as *const Timespec)
-            .build()
-            .user_data(set_timer_on_key(token_index) as _);
-        unsafe {
-            if sq.push(&timeout_e).is_err() {
-                self.backlog.push_back(timeout_e);
+            // link write timeout
+            let timeout_e = opcode::LinkTimeout::new(&self.timespec as *const Timespec)
+                .build()
+                .user_data(set_timer_on_key(token_index) as _);
+            unsafe {
+                if sq.push(&timeout_e).is_err() {
+                    self.backlog.push_back(timeout_e);
+                }
             }
-        }
+        });
     }
 
     fn handle_data(&mut self, mut sq: &mut SubmissionQueue, fd: RawFd,
-                   token_index: usize, buf_index: usize, offset: usize, len: usize) {
-        match self.redis.handle_data(&mut self.buf_alloc, buf_index, offset + len)  {
+                   token_index: usize, mut buf_wrap: BufferWrapper, offset: usize, len: usize) {
+        match self.redis.handle_data(&mut self.buf_alloc, &buf_wrap, offset + len)  {
             HandleResult::NotEnoughData => {
+                self.enqueue_read(&mut sq, token_index, fd, &mut buf_wrap, offset + len);
+
                 self.token_alloc[token_index] = Token::Read{
                     fd,
-                    buf_index,
+                    buf_wrap,
                     offset: offset + len,
                 };
-
-                self.enqueue_read(&mut sq, token_index, fd, buf_index, offset + len);
             },
-            HandleResult::Processed((buf_index, bytes_written, bytes_consumed)) => {
+            HandleResult::Processed((write_buf_wrap, bytes_written, bytes_consumed)) => {
                 // TODO: handle bytes_consumed
+                self.enqueue_write(&mut sq, fd, token_index, &write_buf_wrap, 0, bytes_written);
 
                 self.token_alloc[token_index] = Token::Write {
                     fd,
-                    buf_index,
+                    buf_wrap: write_buf_wrap,
                     len: bytes_written,
                     offset: 0,
                 };
 
-                self.enqueue_write(&mut sq, fd, token_index, buf_index, 0, bytes_written);
-
                 if bytes_consumed < len {
-                    self.handle_data(sq, fd, token_index, buf_index, offset + bytes_consumed, len);
+                    self.handle_data(sq, fd, token_index, buf_wrap, offset + bytes_consumed, len);
                 }
             },
             HandleResult::Error => {
                 println!("Got redis protocol error, closing");
 
-                self.buf_alloc.deallocate_buf(buf_index);
                 self.token_alloc.remove(token_index);
 
                 unsafe {
@@ -218,9 +223,11 @@ impl Reactor {
                     continue;
                 }
 
-                let token = &mut self.token_alloc[token_index];
-                println!("token {:?}", token);
-                match token.clone() {
+                println!("token {:?}", self.token_alloc[token_index]);
+                match self.token_alloc[token_index].clone() {
+                    Token::None => {
+                        unreachable!();
+                    },
                     Token::Accept => {
                         println!("accept");
 
@@ -234,14 +241,17 @@ impl Reactor {
                         }
 
                         // enqueue read
-                        let buf_index = self.buf_alloc.allocate_buf();
+                        let mut buf_wrap= self.buf_alloc.allocate_buf();
 
                         let fd = ret;
-                        let token_index = self.token_alloc.insert(Token::Read{ fd, buf_index, offset: 0 });
 
-                        self.enqueue_read(&mut sq, token_index, fd, buf_index, 0);
+                        let token_index = self.token_alloc.insert(Token::None);
+
+                        self.enqueue_read(&mut sq, token_index, fd, &mut buf_wrap, 0);
+
+                        self.token_alloc[token_index] = Token::Read{ fd, buf_wrap, offset: 0 }
                     }
-                    Token::Read { fd, buf_index, offset } => {
+                    Token::Read { fd, buf_wrap, offset } => {
                         if ret <= 0 {
                             eprintln!(
                                 "closing token {:?} ret {:?} error: {:?}",
@@ -250,7 +260,6 @@ impl Reactor {
                                 io::Error::from_raw_os_error(-ret)
                             );
 
-                            self.buf_alloc.deallocate_buf(buf_index);
                             self.token_alloc.remove(token_index);
 
                             unsafe {
@@ -259,12 +268,12 @@ impl Reactor {
                         } else {
                             let len = ret as usize;
 
-                            self.handle_data(&mut sq, fd, token_index, buf_index, offset, len);
+                            self.handle_data(&mut sq, fd, token_index, buf_wrap, offset, len);
                         }
                     }
                     Token::Write {
                         fd,
-                        buf_index,
+                        mut buf_wrap,
                         offset,
                         len,
                     } => {
@@ -277,7 +286,6 @@ impl Reactor {
                             );
                             println!("shutdown");
 
-                            self.buf_alloc.deallocate_buf(buf_index);
                             self.token_alloc.remove(token_index);
 
                             unsafe {
@@ -287,22 +295,21 @@ impl Reactor {
                             let write_len = ret as usize;
 
                             if offset + write_len >= len {
-                                // enqueue read
-                                *token = Token::Read { fd, buf_index, offset: 0 };
+                                self.enqueue_read(&mut sq, token_index, fd, &mut buf_wrap, offset);
 
-                                self.enqueue_read(&mut sq, token_index, fd, buf_index, offset)
+                                self.token_alloc[token_index] = Token::Read { fd, buf_wrap, offset: 0 };
                             } else {
                                 let offset = offset + write_len;
                                 let len = len - offset;
 
-                                *token = Token::Write {
+                                self.enqueue_write(&mut sq, fd, token_index, &mut buf_wrap, offset, len);
+
+                                self.token_alloc[token_index] = Token::Write {
                                     fd,
-                                    buf_index,
+                                    buf_wrap,
                                     offset,
                                     len,
                                 };
-
-                                self.enqueue_write(&mut sq, fd, token_index, buf_index, offset, len);
                             };
                         }
                     }

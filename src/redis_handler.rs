@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 
-use crate::reusable_slab_allocator::ReusableSlabAllocator;
+use crate::reusable_slab_allocator::{ReusableSlabAllocator, BufferWrapper};
 
 type CommandHandler = fn(&mut RedisHandler, &Vec<redis_protocol::prelude::Frame>, &mut ReusableSlabAllocator, consumed: usize) -> HandleResult;
 
 pub enum HandleResult {
     NotEnoughData,
-    // buf_index to send, buf len and bytes consumed, TODO make this a tuple
-    Processed((usize, usize, usize)),
+    // buf_wrap to send, buf len and bytes consumed, TODO make this a tuple
+    Processed((BufferWrapper, usize, usize)),
     Error,
 }
 
@@ -27,20 +27,28 @@ impl RedisHandler {
             _ => return HandleResult::Error
         };
 
-        let buf_index = buf_alloc.allocate_buf();
+        let mut buf_wrap = buf_alloc.allocate_buf();
 
         let bytes_written = match self.state.get(key) {
             Some(val) => {
-                redis_protocol::prelude::encode(&mut buf_alloc.index(buf_index),
-                                                &redis_protocol::prelude::Frame::BulkString(val.clone())).unwrap()
+                let mut res = 0;
+                buf_wrap.index(|buf: &mut Box<[u8]>| {
+                    res = redis_protocol::prelude::encode(&mut buf[..],
+                                                    &redis_protocol::prelude::Frame::BulkString(val.clone())).unwrap()
+                });
+                res
             },
             None => {
-                redis_protocol::prelude::encode(&mut buf_alloc.index(buf_index),
-                                                &redis_protocol::prelude::Frame::Null).unwrap()
+                let mut res = 0;
+                buf_wrap.index(|buf: &mut Box<[u8]>| {
+                    res = redis_protocol::prelude::encode(&mut buf[..],
+                                                    &redis_protocol::prelude::Frame::Null).unwrap()
+                });
+                res
             }
         };
 
-        return HandleResult::Processed((buf_index, bytes_written, consumed));
+        return HandleResult::Processed((buf_wrap, bytes_written, consumed));
     }
 
     pub fn handle_set(&mut self, args: &Vec<redis_protocol::prelude::Frame>, buf_alloc: &mut ReusableSlabAllocator, consumed: usize) -> HandleResult {
@@ -60,21 +68,29 @@ impl RedisHandler {
 
         self.state.insert(key.to_vec(), value.to_vec());
 
-        let buf_index = buf_alloc.allocate_buf();
+        let mut buf_wrap = buf_alloc.allocate_buf();
 
-        let bytes_written = redis_protocol::prelude::encode(&mut buf_alloc.index(buf_index),
-                                        &redis_protocol::prelude::Frame::SimpleString(String::from("OK"))).unwrap();
+        let bytes_written = 0;
 
-        return HandleResult::Processed((buf_index, bytes_written, consumed));
+
+        buf_wrap.index(|buf: &mut Box<[u8]>| {
+            redis_protocol::prelude::encode(&mut buf[..],
+                                            &redis_protocol::prelude::Frame::SimpleString(String::from("OK"))).unwrap();
+        });
+
+        return HandleResult::Processed((buf_wrap, bytes_written, consumed));
     }
 
     pub fn handle_command(&mut self, _args: &Vec<redis_protocol::prelude::Frame>, buf_alloc: &mut ReusableSlabAllocator, consumed: usize) -> HandleResult {
-        let buf_index = buf_alloc.allocate_buf();
+        let mut buf_wrap = buf_alloc.allocate_buf();
 
-        let bytes_written = redis_protocol::prelude::encode(&mut buf_alloc.index(buf_index),
-                                                            &redis_protocol::prelude::Frame::Array(Vec::new())).unwrap();
+        let mut bytes_written = 0;
+        buf_wrap.index(|buf: &mut Box<[u8]>| {
+            bytes_written = redis_protocol::prelude::encode(&mut buf[..],
+                                                                &redis_protocol::prelude::Frame::Array(Vec::new())).unwrap();
+        });
 
-        return HandleResult::Processed((buf_index, bytes_written, consumed));
+        return HandleResult::Processed((buf_wrap, bytes_written, consumed));
     }
 
     pub fn new() -> RedisHandler {
@@ -122,23 +138,28 @@ impl RedisHandler {
         }
     }
 
-    pub fn handle_data(&mut self, mut buf_alloc: &mut ReusableSlabAllocator, buf_index: usize, len: usize) -> HandleResult {
-        match redis_protocol::prelude::decode(&buf_alloc.index(buf_index)[0..len]) {
-            Ok((frame, consumed)) => {
-                match frame {
-                    Some(frame) => {
-                        return self.handle_frame(&frame, &mut buf_alloc, consumed);
+    pub fn handle_data(&mut self, mut buf_alloc: &mut ReusableSlabAllocator, buf_wrap: &BufferWrapper, len: usize) -> HandleResult {
+        let mut result: HandleResult = HandleResult::NotEnoughData;
+        buf_wrap.index_non_mut(|buf: &Box<[u8]>| {
+            match redis_protocol::prelude::decode(&buf[0..len]) {
+                Ok((frame, consumed)) => {
+                    match frame {
+                        Some(frame) => {
+                            result = self.handle_frame(&frame, &mut buf_alloc, consumed);
+                        }
+                        None => {
+                            println!("Incomplete command, need more data...");
+                            result = HandleResult::NotEnoughData;
+                        }
                     }
-                    None => {
-                        println!("Incomplete command, need more data...");
-                        return HandleResult::NotEnoughData;
-                    }
+                },
+                Err(e) => {
+                    println!("Error parsing redis command: {:?}", e);
+                    result = HandleResult::Error;
                 }
-            },
-            Err(e) => {
-                println!("Error parsing redis command: {:?}", e);
-                return HandleResult::Error;
-            }
-        };
+            };
+        });
+
+        return result;
     }
 }
