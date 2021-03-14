@@ -33,7 +33,7 @@ impl RedisHandler {
             Some(val) => {
                 redis_protocol::prelude::encode(&mut buf_alloc.index(buf_index),
                                                 &redis_protocol::prelude::Frame::BulkString(val.clone())).unwrap()
-            },
+            }
             None => {
                 redis_protocol::prelude::encode(&mut buf_alloc.index(buf_index),
                                                 &redis_protocol::prelude::Frame::Null).unwrap()
@@ -63,7 +63,7 @@ impl RedisHandler {
         let buf_index = buf_alloc.allocate_buf();
 
         let bytes_written = redis_protocol::prelude::encode(&mut buf_alloc.index(buf_index),
-                                        &redis_protocol::prelude::Frame::SimpleString(String::from("OK"))).unwrap();
+                                                            &redis_protocol::prelude::Frame::SimpleString(String::from("OK"))).unwrap();
 
         return HandleResult::Processed((buf_index, bytes_written, consumed));
     }
@@ -80,7 +80,7 @@ impl RedisHandler {
     pub fn new() -> RedisHandler {
         let command_handlers = HashMap::new();
 
-        let mut handler = RedisHandler{
+        let mut handler = RedisHandler {
             command_handlers,
             state: HashMap::new(),
         };
@@ -113,8 +113,7 @@ impl RedisHandler {
                         return HandleResult::Error;
                     }
                 };
-
-            },
+            }
             kind => {
                 println!("got unknown kind: {:?} ignoring", kind);
                 return HandleResult::Error;
@@ -134,11 +133,59 @@ impl RedisHandler {
                         return HandleResult::NotEnoughData;
                     }
                 }
-            },
+            }
             Err(e) => {
                 println!("Error parsing redis command: {:?}", e);
                 return HandleResult::Error;
             }
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::redis_handler::{RedisHandler, HandleResult};
+    use crate::reusable_slab_allocator::ReusableSlabAllocator;
+
+    #[test]
+    fn parse_get_set() {
+        let mut handler = RedisHandler::new();
+        let mut allocator = ReusableSlabAllocator::new();
+
+        {
+            let set_buf_index = allocator.allocate_buf();
+            let set_data = "*3\r\n$3\r\nSET\r\n$4\r\nswag\r\n$4\r\nyolo\r\n";
+            allocator.index(set_buf_index)[..set_data.len()].copy_from_slice(set_data.as_bytes());
+
+            match handler.handle_data(&mut allocator, set_buf_index, set_data.len()) {
+                HandleResult::Processed((write_buf_index, write_len, bytes_consumed)) => {
+                    assert_eq!(bytes_consumed, set_data.len());
+                    let ok_string = "+OK\r\n";
+                    assert_eq!(write_len, ok_string.len());
+                    assert_eq!(&allocator.index(write_buf_index)[..write_len], ok_string.as_bytes());
+                }
+                _ => {
+                    assert!(false, "got wrong HandleResult");
+                }
+            }
+        }
+
+        {
+            let get_buf_index = allocator.allocate_buf();
+            let get_data = "*2\r\n$3\r\nGET\r\n$4\r\nswag\r\n";
+            allocator.index(get_buf_index)[..get_data.len()].copy_from_slice(get_data.as_bytes());
+
+            match handler.handle_data(&mut allocator, get_buf_index, get_data.len()) {
+                HandleResult::Processed((write_buf_index, write_len, bytes_consumed)) => {
+                    assert_eq!(bytes_consumed, get_data.len());
+                    let resp_string = "$4\r\nyolo\r\n";
+                    assert_eq!(write_len, resp_string.len());
+                    assert_eq!(&allocator.index(write_buf_index)[..write_len], resp_string.as_bytes());
+                }
+                _ => {
+                    assert!(false, "got wrong HandleResult");
+                }
+            }
+        }
     }
 }
