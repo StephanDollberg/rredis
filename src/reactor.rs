@@ -61,8 +61,12 @@ pub struct Reactor {
 }
 
 impl Reactor {
-    pub fn new() -> anyhow::Result<Reactor> {
-        let listener = TcpListener::bind(("127.0.0.1", 3456))?;
+    pub fn new() ->anyhow::Result<Reactor> {
+        return Reactor::new_with_port(3456);
+    }
+
+    pub fn new_with_port(port: u16) -> anyhow::Result<Reactor> {
+        let listener = TcpListener::bind(("127.0.0.1", port))?;
 
         let backlog = VecDeque::new();
         let token_alloc = Slab::with_capacity(64);
@@ -81,6 +85,11 @@ impl Reactor {
             context_alloc: Slab::with_capacity(64),
             redis: RedisHandler::new(),
         })
+    }
+
+    #[cfg(test)]
+    fn port(&self) -> u16 {
+        return self.listener.local_addr().unwrap().port();
     }
 
     fn enqueue_read(&mut self, sq: &mut SubmissionQueue, token_index: usize, fd: RawFd,
@@ -111,7 +120,6 @@ impl Reactor {
 
     fn enqueue_write(&mut self, sq: &mut SubmissionQueue, fd: RawFd, token_index: usize,
                      buf_index: usize, offset: usize, len: usize) {
-
 
         let buf = &self.buf_alloc.index(buf_index)[offset..];
         let write_e = opcode::Send::new(types::Fd(fd), buf.as_ptr(), len as _)
@@ -151,6 +159,8 @@ impl Reactor {
             HandleResult::Processed((write_buf_index, bytes_written, bytes_consumed)) => {
                 self.context_alloc[context_index].read_buf_len -= bytes_consumed;
                 self.context_alloc[context_index].read_buf_offset += bytes_consumed;
+                self.context_alloc[context_index].write_len = bytes_written;
+                self.context_alloc[context_index].write_buf_offset = 0;
 
                 self.enqueue_write(&mut sq, fd, self.context_alloc[context_index].write_token_index,
                                    write_buf_index, 0, bytes_written);
@@ -170,6 +180,9 @@ impl Reactor {
     }
 
     pub fn run(&mut self) -> anyhow::Result<()> {
+        // TODO move this out so that we can just run in lockstep
+        // Needs fighting with lifetimes
+
         let mut ring = IoUring::new(256)?;
         let (submitter, mut sq, mut cq) = ring.split();
 
@@ -332,4 +345,47 @@ impl Reactor {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::reactor::Reactor;
+    use std::net::TcpStream;
+    use std::io::{Write, Read};
+
+    #[test]
+    fn basic_smoke_test() {
+        let mut reactor = Reactor::new_with_port(0).unwrap();
+        let port = reactor.port();
+
+        std::thread::spawn(move || {
+            reactor.run().unwrap();
+        });
+
+        let mut sock = TcpStream::connect(("localhost", port)).unwrap();
+
+        {
+            sock.write_all("*3\r\n$3\r\nSET\r\n$4\r\nswag\r\n$4\r\nyolo\r\n".as_bytes()).unwrap();
+            let mut buf: [u8; 1000] = [0; 1000];
+            let bytes_read = sock.read(&mut buf).unwrap();
+
+            let expected_response = "+OK\r\n";
+
+            assert_eq!(bytes_read, expected_response.len());
+            assert_eq!(expected_response.as_bytes()[..], buf[..bytes_read]);
+        }
+
+        {
+            sock.write_all("*2\r\n$3\r\nGET\r\n$4\r\nswag\r\n".as_bytes()).unwrap();
+            let mut buf: [u8; 1000] = [0; 1000];
+            let bytes_read = sock.read(&mut buf).unwrap();
+
+            let expected_response = "$4\r\nyolo\r\n";
+
+            assert_eq!(bytes_read, expected_response.len());
+            assert_eq!(expected_response.as_bytes()[..], buf[..bytes_read]);
+        }
+    }
+
+    // TODO: test partial command
 }

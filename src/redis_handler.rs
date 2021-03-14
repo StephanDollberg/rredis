@@ -188,4 +188,6 @@ mod tests {
             }
         }
     }
+    
+    // TODO: test partial command
 }
