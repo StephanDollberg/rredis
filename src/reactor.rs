@@ -105,6 +105,8 @@ impl Reactor {
 
     fn enqueue_write(&mut self, sq: &mut SubmissionQueue, fd: RawFd, token_index: usize,
                      buf_index: usize, offset: usize, len: usize) {
+
+
         let buf = &self.buf_alloc.index(buf_index)[offset..];
         let write_e = opcode::Send::new(types::Fd(fd), buf.as_ptr(), len as _)
             .build()
@@ -129,38 +131,47 @@ impl Reactor {
     }
 
     fn handle_data(&mut self, mut sq: &mut SubmissionQueue, fd: RawFd,
-                   token_index: usize, buf_index: usize, offset: usize, len: usize) {
-        match self.redis.handle_data(&mut self.buf_alloc, buf_index, offset + len)  {
+                   read_token_index: usize, read_buf_index: usize, offset: usize, len: usize) {
+        match self.redis.handle_data(&mut self.buf_alloc, read_buf_index, offset + len)  {
             HandleResult::NotEnoughData => {
-                self.token_alloc[token_index] = Token::Read{
+                self.token_alloc[read_token_index] = Token::Read{
                     fd,
-                    buf_index,
+                    buf_index: read_buf_index,
                     offset: offset + len,
                 };
 
-                self.enqueue_read(&mut sq, token_index, fd, buf_index, offset + len);
+                self.enqueue_read(&mut sq, read_token_index, fd, read_buf_index, offset + len);
             },
-            HandleResult::Processed((buf_index, bytes_written, bytes_consumed)) => {
+            HandleResult::Processed((write_buf_index, bytes_written, bytes_consumed)) => {
                 // TODO: handle bytes_consumed
 
-                self.token_alloc[token_index] = Token::Write {
+                let write_token = self.token_alloc.insert(Token::Write {
                     fd,
-                    buf_index,
+                    buf_index: write_buf_index,
                     len: bytes_written,
                     offset: 0,
-                };
+                });
 
-                self.enqueue_write(&mut sq, fd, token_index, buf_index, 0, bytes_written);
+                self.enqueue_write(&mut sq, fd, write_token, write_buf_index, 0, bytes_written);
 
                 if bytes_consumed < len {
-                    self.handle_data(sq, fd, token_index, buf_index, offset + bytes_consumed, len);
+                    self.handle_data(sq, fd, read_token_index, read_buf_index, offset + bytes_consumed, len);
+                }
+                else if bytes_consumed >= len {
+                    self.token_alloc[read_token_index] = Token::Read{
+                        fd,
+                        buf_index: read_buf_index,
+                        offset: 0,
+                    };
+
+                    self.enqueue_read(&mut sq, read_token_index, fd, read_buf_index, 0);
                 }
             },
             HandleResult::Error => {
                 println!("Got redis protocol error, closing");
 
-                self.buf_alloc.deallocate_buf(buf_index);
-                self.token_alloc.remove(token_index);
+                self.buf_alloc.deallocate_buf(read_buf_index);
+                self.token_alloc.remove(read_token_index);
 
                 unsafe {
                     libc::close(fd);
@@ -286,12 +297,7 @@ impl Reactor {
                         } else {
                             let write_len = ret as usize;
 
-                            if offset + write_len >= len {
-                                // enqueue read
-                                *token = Token::Read { fd, buf_index, offset: 0 };
-
-                                self.enqueue_read(&mut sq, token_index, fd, buf_index, offset)
-                            } else {
+                            if offset + write_len < len {
                                 let offset = offset + write_len;
                                 let len = len - offset;
 
@@ -303,7 +309,10 @@ impl Reactor {
                                 };
 
                                 self.enqueue_write(&mut sq, fd, token_index, buf_index, offset, len);
-                            };
+                            } else {
+                                self.buf_alloc.deallocate_buf(buf_index);
+                                self.token_alloc.remove(token_index);
+                            }
                         }
                     }
                 }
