@@ -121,8 +121,8 @@ impl RedisHandler {
         }
     }
 
-    pub fn handle_data(&mut self, mut buf_alloc: &mut ReusableSlabAllocator, buf_index: usize, len: usize) -> HandleResult {
-        match redis_protocol::prelude::decode(&buf_alloc.index(buf_index)[0..len]) {
+    pub fn handle_data(&mut self, mut buf_alloc: &mut ReusableSlabAllocator, buf_index: usize, offset: usize, len: usize) -> HandleResult {
+        match redis_protocol::prelude::decode(&buf_alloc.index(buf_index)[offset..offset+len]) {
             Ok((frame, consumed)) => {
                 match frame {
                     Some(frame) => {
@@ -157,7 +157,7 @@ mod tests {
             let set_data = "*3\r\n$3\r\nSET\r\n$4\r\nswag\r\n$4\r\nyolo\r\n";
             allocator.index(set_buf_index)[..set_data.len()].copy_from_slice(set_data.as_bytes());
 
-            match handler.handle_data(&mut allocator, set_buf_index, set_data.len()) {
+            match handler.handle_data(&mut allocator, set_buf_index, 0, set_data.len()) {
                 HandleResult::Processed((write_buf_index, write_len, bytes_consumed)) => {
                     assert_eq!(bytes_consumed, set_data.len());
                     let ok_string = "+OK\r\n";
@@ -175,7 +175,7 @@ mod tests {
             let get_data = "*2\r\n$3\r\nGET\r\n$4\r\nswag\r\n";
             allocator.index(get_buf_index)[..get_data.len()].copy_from_slice(get_data.as_bytes());
 
-            match handler.handle_data(&mut allocator, get_buf_index, get_data.len()) {
+            match handler.handle_data(&mut allocator, get_buf_index, 0, get_data.len()) {
                 HandleResult::Processed((write_buf_index, write_len, bytes_consumed)) => {
                     assert_eq!(bytes_consumed, get_data.len());
                     let resp_string = "$4\r\nyolo\r\n";
@@ -188,6 +188,6 @@ mod tests {
             }
         }
     }
-    
+
     // TODO: test partial command
 }

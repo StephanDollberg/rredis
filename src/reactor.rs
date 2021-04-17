@@ -150,7 +150,7 @@ impl Reactor {
         let read_buf_index = self.context_alloc[context_index].read_buf_index;
         let read_token_index = self.context_alloc[context_index].read_token_index;
 
-        match self.redis.handle_data(&mut self.buf_alloc, read_buf_index, offset + len)  {
+        match self.redis.handle_data(&mut self.buf_alloc, read_buf_index, offset, len)  {
             HandleResult::NotEnoughData => {
                 self.context_alloc[context_index].read_buf_offset = offset + len;
 
@@ -176,7 +176,6 @@ impl Reactor {
                 }
             }
         }
-
     }
 
     pub fn run(&mut self) -> anyhow::Result<()> {
@@ -381,6 +380,33 @@ mod tests {
             let bytes_read = sock.read(&mut buf).unwrap();
 
             let expected_response = "$4\r\nyolo\r\n";
+
+            assert_eq!(bytes_read, expected_response.len());
+            assert_eq!(expected_response.as_bytes()[..], buf[..bytes_read]);
+        }
+    }
+
+    #[test]
+    fn test_pipeline() {
+        let mut reactor = Reactor::new_with_port(0).unwrap();
+        let port = reactor.port();
+
+        std::thread::spawn(move || {
+            reactor.run().unwrap();
+        });
+
+        let mut sock = TcpStream::connect(("localhost", port)).unwrap();
+
+        sock.write_all("*3\r\n$3\r\nSET\r\n$4\r\nswag\r\n$4\r\nyolo\r\n*2\r\n$3\r\nGET\r\n$4\r\nswag\r\n".as_bytes()).unwrap();
+
+        {
+            let mut buf: [u8; 1000] = [0; 1000];
+            let mut bytes_read = 0;
+            let expected_response = "+OK\r\n$4\r\nyolo\r\n";
+
+            while bytes_read < expected_response.len() {
+                bytes_read += sock.read(&mut buf[bytes_read..]).unwrap();
+            }
 
             assert_eq!(bytes_read, expected_response.len());
             assert_eq!(expected_response.as_bytes()[..], buf[..bytes_read]);
