@@ -21,16 +21,37 @@ enum Token {
     Write(usize),
 }
 
+// Current works like this:
+// For each connection we have one context which can have one outstanding read and write
+// Each is inserted into iouring with the read or write token
+// Context has a separate read and write buffer for both which are currently tracked by index (use Rc instead?)
+
 #[derive(Clone, Debug)]
 struct Context {
+    // index into the token slab (for the read token)
     read_token_index: usize,
+
+    // index into the token slab (for the write token)
     write_token_index: usize,
+
     fd: RawFd,
+
+    // index into the buffer slab
     read_buf_index: usize,
+
+    // which offset are we at in the buffer
     read_buf_offset: usize,
+
+    // how much data we have left starting from offset
     read_buf_len: usize,
+
+    // index into the buffer slab
     write_buf_index: usize,
+
+    // which offset are we at in the buffer
     write_buf_offset: usize,
+
+    // how much data we have left starting from offset
     write_len: usize,
 }
 
