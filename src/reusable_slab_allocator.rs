@@ -1,38 +1,62 @@
-use slab::Slab;
+use std::rc::Rc;
+use std::cell::{RefCell};
+use std::fmt;
 
-pub struct ReusableSlabAllocator {
-    bufpool: Vec<usize>,
-    buf_alloc: Slab<Box<[u8]>>,
+pub struct BufferPoolAllocatorImpl {
+    bufpool: Vec<Rc<RefCell<Box<[u8]>>>>,
 }
 
-impl ReusableSlabAllocator {
-    pub fn new() -> ReusableSlabAllocator {
-        return ReusableSlabAllocator {
+impl BufferPoolAllocatorImpl {
+    pub fn new() -> BufferPoolAllocatorImpl {
+        return BufferPoolAllocatorImpl {
             bufpool: Vec::with_capacity(64),
-            buf_alloc: Slab::with_capacity(64),
         }
     }
 
-    pub fn allocate_buf(&mut self) -> usize {
-        let buf_index = match self.bufpool.pop() {
-            Some(buf_index) => buf_index,
+    pub fn allocate_buf(&mut self) -> Rc<RefCell<Box<[u8]>>> {
+        return match self.bufpool.pop() {
+            Some(buf) => buf,
             None => {
-                let buf = vec![0u8; 2048].into_boxed_slice();
-                let buf_entry = self.buf_alloc.vacant_entry();
-                let buf_index = buf_entry.key();
-                buf_entry.insert(buf);
-                buf_index
+                Rc::from(RefCell::new(Box::from(vec![0u8; 2048])))
             }
         };
-
-        return buf_index;
     }
 
-    pub fn deallocate_buf(&mut self, buf_index: usize) {
-        self.bufpool.push(buf_index);
+    pub fn deallocate_buf(&mut self, buf: Rc<RefCell<Box<[u8]>>>) {
+        self.bufpool.push(buf);
     }
+}
 
-    pub fn index(&mut self, buf_index: usize) -> &mut Box<[u8]> {
-        return &mut self.buf_alloc[buf_index];
+pub type BufferPoolAllocator = Rc<RefCell<BufferPoolAllocatorImpl>>;
+
+pub fn make_buffer_pool_allocator() -> BufferPoolAllocator {
+    return Rc::new(RefCell::new(BufferPoolAllocatorImpl::new()));
+}
+
+#[derive(Clone)]
+pub struct BufWrap {
+    pub buf: Rc<RefCell<Box<[u8]>>>,
+    allocator: BufferPoolAllocator,
+}
+
+impl Drop for BufWrap {
+    fn drop(&mut self) {
+        self.allocator.borrow_mut().deallocate_buf(self.buf.clone());
+    }
+}
+
+impl fmt::Debug for BufWrap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BufWrap")
+            .field("addr", & (&self.buf.borrow()[0] as *const u8))
+            .finish()
+    }
+}
+
+pub fn allocate_buf(allocator: BufferPoolAllocator) -> BufWrap {
+    let buf = allocator.borrow_mut().allocate_buf();
+    return BufWrap {
+        buf,
+        allocator,
     }
 }

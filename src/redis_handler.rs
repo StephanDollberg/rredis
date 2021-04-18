@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 
-use crate::reusable_slab_allocator::ReusableSlabAllocator;
+use crate::reusable_slab_allocator::*;
 
-type CommandHandler = fn(&mut RedisHandler, &Vec<redis_protocol::prelude::Frame>, &mut ReusableSlabAllocator, consumed: usize) -> HandleResult;
+type CommandHandler = fn(&mut RedisHandler, &Vec<redis_protocol::prelude::Frame>, &mut BufferPoolAllocator, consumed: usize) -> HandleResult;
 
 pub enum HandleResult {
     NotEnoughData,
     // buf_index to send, buf len and bytes consumed, TODO make this a tuple
-    Processed((usize, usize, usize)),
+    Processed((BufWrap, usize, usize)),
     Error,
 }
 
@@ -17,7 +17,7 @@ pub struct RedisHandler {
 }
 
 impl RedisHandler {
-    pub fn handle_get(&mut self, args: &Vec<redis_protocol::prelude::Frame>, buf_alloc: &mut ReusableSlabAllocator, consumed: usize) -> HandleResult {
+    pub fn handle_get(&mut self, args: &Vec<redis_protocol::prelude::Frame>, buf_alloc: &mut BufferPoolAllocator, consumed: usize) -> HandleResult {
         if args.len() < 2 {
             return HandleResult::Error;
         }
@@ -27,23 +27,23 @@ impl RedisHandler {
             _ => return HandleResult::Error
         };
 
-        let buf_index = buf_alloc.allocate_buf();
+        let buffer = allocate_buf(buf_alloc.clone());
 
         let bytes_written = match self.state.get(key) {
             Some(val) => {
-                redis_protocol::prelude::encode(&mut buf_alloc.index(buf_index),
+                redis_protocol::prelude::encode(&mut buffer.buf.borrow_mut()[..],
                                                 &redis_protocol::prelude::Frame::BulkString(val.clone())).unwrap()
             }
             None => {
-                redis_protocol::prelude::encode(&mut buf_alloc.index(buf_index),
+                redis_protocol::prelude::encode(&mut buffer.buf.borrow_mut()[..],
                                                 &redis_protocol::prelude::Frame::Null).unwrap()
             }
         };
 
-        return HandleResult::Processed((buf_index, bytes_written, consumed));
+        return HandleResult::Processed((buffer, bytes_written, consumed));
     }
 
-    pub fn handle_set(&mut self, args: &Vec<redis_protocol::prelude::Frame>, buf_alloc: &mut ReusableSlabAllocator, consumed: usize) -> HandleResult {
+    pub fn handle_set(&mut self, args: &Vec<redis_protocol::prelude::Frame>, buf_alloc: &mut BufferPoolAllocator, consumed: usize) -> HandleResult {
         if args.len() < 3 {
             return HandleResult::Error;
         }
@@ -60,21 +60,21 @@ impl RedisHandler {
 
         self.state.insert(key.to_vec(), value.to_vec());
 
-        let buf_index = buf_alloc.allocate_buf();
+        let buffer = allocate_buf(buf_alloc.clone());
 
-        let bytes_written = redis_protocol::prelude::encode(&mut buf_alloc.index(buf_index),
+        let bytes_written = redis_protocol::prelude::encode(&mut buffer.buf.borrow_mut()[..],
                                                             &redis_protocol::prelude::Frame::SimpleString(String::from("OK"))).unwrap();
 
-        return HandleResult::Processed((buf_index, bytes_written, consumed));
+        return HandleResult::Processed((buffer, bytes_written, consumed));
     }
 
-    pub fn handle_command(&mut self, _args: &Vec<redis_protocol::prelude::Frame>, buf_alloc: &mut ReusableSlabAllocator, consumed: usize) -> HandleResult {
-        let buf_index = buf_alloc.allocate_buf();
+    pub fn handle_command(&mut self, _args: &Vec<redis_protocol::prelude::Frame>, buf_alloc: &mut BufferPoolAllocator, consumed: usize) -> HandleResult {
+        let buffer = allocate_buf(buf_alloc.clone());
 
-        let bytes_written = redis_protocol::prelude::encode(&mut buf_alloc.index(buf_index),
+        let bytes_written = redis_protocol::prelude::encode(&mut buffer.buf.borrow_mut()[..],
                                                             &redis_protocol::prelude::Frame::Array(Vec::new())).unwrap();
 
-        return HandleResult::Processed((buf_index, bytes_written, consumed));
+        return HandleResult::Processed((buffer, bytes_written, consumed));
     }
 
     pub fn new() -> RedisHandler {
@@ -92,7 +92,7 @@ impl RedisHandler {
         return handler;
     }
 
-    fn handle_frame(&mut self, frame: &redis_protocol::prelude::Frame, mut buf_alloc: &mut ReusableSlabAllocator, consumed: usize) -> HandleResult {
+    fn handle_frame(&mut self, frame: &redis_protocol::prelude::Frame, mut buf_alloc: &mut BufferPoolAllocator, consumed: usize) -> HandleResult {
         match frame {
             redis_protocol::prelude::Frame::Array(vec) => {
                 let maybe_command = &vec[0];
@@ -121,8 +121,8 @@ impl RedisHandler {
         }
     }
 
-    pub fn handle_data(&mut self, mut buf_alloc: &mut ReusableSlabAllocator, buf_index: usize, offset: usize, len: usize) -> HandleResult {
-        match redis_protocol::prelude::decode(&buf_alloc.index(buf_index)[offset..offset+len]) {
+    pub fn handle_data(&mut self, mut buf_alloc: &mut BufferPoolAllocator, buffer: &BufWrap, offset: usize, len: usize) -> HandleResult {
+        match redis_protocol::prelude::decode(&buffer.buf.borrow()[offset..offset+len]) {
             Ok((frame, consumed)) => {
                 match frame {
                     Some(frame) => {
@@ -145,24 +145,24 @@ impl RedisHandler {
 #[cfg(test)]
 mod tests {
     use crate::redis_handler::{RedisHandler, HandleResult};
-    use crate::reusable_slab_allocator::ReusableSlabAllocator;
+    use crate::reusable_slab_allocator::*;
 
     #[test]
     fn parse_get_set() {
         let mut handler = RedisHandler::new();
-        let mut allocator = ReusableSlabAllocator::new();
+        let mut allocator = make_buffer_pool_allocator();
 
         {
-            let set_buf_index = allocator.allocate_buf();
+            let buffer = allocate_buf(allocator.clone());
             let set_data = "*3\r\n$3\r\nSET\r\n$4\r\nswag\r\n$4\r\nyolo\r\n";
-            allocator.index(set_buf_index)[..set_data.len()].copy_from_slice(set_data.as_bytes());
+            buffer.buf.borrow_mut()[..set_data.len()].copy_from_slice(set_data.as_bytes());
 
-            match handler.handle_data(&mut allocator, set_buf_index, 0, set_data.len()) {
-                HandleResult::Processed((write_buf_index, write_len, bytes_consumed)) => {
+            match handler.handle_data(&mut allocator, &buffer, 0, set_data.len()) {
+                HandleResult::Processed((write_buffer, write_len, bytes_consumed)) => {
                     assert_eq!(bytes_consumed, set_data.len());
                     let ok_string = "+OK\r\n";
                     assert_eq!(write_len, ok_string.len());
-                    assert_eq!(&allocator.index(write_buf_index)[..write_len], ok_string.as_bytes());
+                    assert_eq!(&write_buffer.buf.borrow()[..write_len], ok_string.as_bytes());
                 }
                 _ => {
                     assert!(false, "got wrong HandleResult");
@@ -171,16 +171,16 @@ mod tests {
         }
 
         {
-            let get_buf_index = allocator.allocate_buf();
+            let buffer = allocate_buf(allocator.clone());
             let get_data = "*2\r\n$3\r\nGET\r\n$4\r\nswag\r\n";
-            allocator.index(get_buf_index)[..get_data.len()].copy_from_slice(get_data.as_bytes());
+            buffer.buf.borrow_mut()[..get_data.len()].copy_from_slice(get_data.as_bytes());
 
-            match handler.handle_data(&mut allocator, get_buf_index, 0, get_data.len()) {
-                HandleResult::Processed((write_buf_index, write_len, bytes_consumed)) => {
+            match handler.handle_data(&mut allocator, &buffer, 0, get_data.len()) {
+                HandleResult::Processed((write_buffer, write_len, bytes_consumed)) => {
                     assert_eq!(bytes_consumed, get_data.len());
                     let resp_string = "$4\r\nyolo\r\n";
                     assert_eq!(write_len, resp_string.len());
-                    assert_eq!(&allocator.index(write_buf_index)[..write_len], resp_string.as_bytes());
+                    assert_eq!(&write_buffer.buf.borrow()[..write_len], resp_string.as_bytes());
                 }
                 _ => {
                     assert!(false, "got wrong HandleResult");
