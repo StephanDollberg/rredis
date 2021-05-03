@@ -6,8 +6,8 @@ type CommandHandler = fn(&mut RedisHandler, &Vec<redis_protocol::prelude::Frame>
 
 pub enum HandleResult {
     NotEnoughData,
-    // buf_index to send, buf len and bytes consumed, TODO make this a tuple
-    Processed((BufWrap, usize, usize)),
+    // buf_index to send, buf len, bytes consumed, write_wal, TODO make this a struct
+    Processed((BufWrap, usize, usize, bool)),
     Error,
 }
 
@@ -40,7 +40,7 @@ impl RedisHandler {
             }
         };
 
-        return HandleResult::Processed((buffer, bytes_written, consumed));
+        return HandleResult::Processed((buffer, bytes_written, consumed, false));
     }
 
     pub fn handle_set(&mut self, args: &Vec<redis_protocol::prelude::Frame>, buf_alloc: &mut BufferPoolAllocator, consumed: usize) -> HandleResult {
@@ -65,7 +65,7 @@ impl RedisHandler {
         let bytes_written = redis_protocol::prelude::encode(&mut buffer.borrow_mut().buf.as_mut().unwrap()[..],
                                                             &redis_protocol::prelude::Frame::SimpleString(String::from("OK"))).unwrap();
 
-        return HandleResult::Processed((buffer, bytes_written, consumed));
+        return HandleResult::Processed((buffer, bytes_written, consumed, true));
     }
 
     pub fn handle_command(&mut self, _args: &Vec<redis_protocol::prelude::Frame>, buf_alloc: &mut BufferPoolAllocator, consumed: usize) -> HandleResult {
@@ -74,7 +74,7 @@ impl RedisHandler {
         let bytes_written = redis_protocol::prelude::encode(&mut buffer.borrow_mut().buf.as_mut().unwrap()[..],
                                                             &redis_protocol::prelude::Frame::Array(Vec::new())).unwrap();
 
-        return HandleResult::Processed((buffer, bytes_written, consumed));
+        return HandleResult::Processed((buffer, bytes_written, consumed, false));
     }
 
     pub fn new() -> RedisHandler {
@@ -121,8 +121,13 @@ impl RedisHandler {
         }
     }
 
-    pub fn handle_data(&mut self, mut buf_alloc: &mut BufferPoolAllocator, buffer: &BufWrap, offset: usize, len: usize) -> HandleResult {
-        match redis_protocol::prelude::decode(&buffer.borrow().buf.as_ref().unwrap()[offset..offset+len]) {
+    pub fn handle_data_from_buf_wrap(&mut self, mut buf_alloc: &mut BufferPoolAllocator, buffer: &BufWrap,
+                                     offset: usize, len: usize) -> HandleResult {
+        return self.handle_data_from_slice(&mut buf_alloc, &buffer.borrow().buf.as_ref().unwrap()[offset..offset+len]);
+    }
+
+    pub fn handle_data_from_slice(&mut self, mut buf_alloc: &mut BufferPoolAllocator, buffer: &[u8]) -> HandleResult {
+        match redis_protocol::prelude::decode(buffer) {
             Ok((frame, consumed)) => {
                 match frame {
                     Some(frame) => {
@@ -157,8 +162,8 @@ mod tests {
             let set_data = "*3\r\n$3\r\nSET\r\n$4\r\nswag\r\n$4\r\nyolo\r\n";
             buffer.borrow_mut().buf.as_mut().unwrap()[..set_data.len()].copy_from_slice(set_data.as_bytes());
 
-            match handler.handle_data(&mut allocator, &buffer, 0, set_data.len()) {
-                HandleResult::Processed((write_buffer, write_len, bytes_consumed)) => {
+            match handler.handle_data_from_buf_wrap(&mut allocator, &buffer, 0, set_data.len()) {
+                HandleResult::Processed((write_buffer, write_len, bytes_consumed, _wal)) => {
                     assert_eq!(bytes_consumed, set_data.len());
                     let ok_string = "+OK\r\n";
                     assert_eq!(write_len, ok_string.len());
@@ -175,8 +180,8 @@ mod tests {
             let get_data = "*2\r\n$3\r\nGET\r\n$4\r\nswag\r\n";
             buffer.borrow_mut().buf.as_mut().unwrap()[..get_data.len()].copy_from_slice(get_data.as_bytes());
 
-            match handler.handle_data(&mut allocator, &buffer, 0, get_data.len()) {
-                HandleResult::Processed((write_buffer, write_len, bytes_consumed)) => {
+            match handler.handle_data_from_buf_wrap(&mut allocator, &buffer, 0, get_data.len()) {
+                HandleResult::Processed((write_buffer, write_len, bytes_consumed, _wal)) => {
                     assert_eq!(bytes_consumed, get_data.len());
                     let resp_string = "$4\r\nyolo\r\n";
                     assert_eq!(write_len, resp_string.len());

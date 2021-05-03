@@ -11,20 +11,24 @@ use crate::redis_handler::RedisHandler;
 use crate::redis_handler::HandleResult;
 use crate::reusable_slab_allocator::*;
 use std::collections::VecDeque;
+use std::fs::{File, OpenOptions};
+use std::io::Read;
 
 extern crate redis_protocol;
+
 
 #[derive(Clone, Debug)]
 enum Token {
     Accept,
-    Read(usize),
-    Write(usize),
+    Read(usize), // context index
+    Write(usize), // context index
+    WalWrite,
 }
 
 // Current works like this:
 // For each connection we have one context which can have one outstanding read and write
-// Each is inserted into iouring with the read or write token
-// Context has a separate read and write buffer for both which are currently tracked by index (use Rc instead?)
+// Each is inserted into iouring with the read or write token whose index points into the context slab
+// Context has a separate read and write buffer
 
 #[derive(Clone, Debug)]
 struct Context {
@@ -55,6 +59,12 @@ struct Context {
     write_len: usize,
 }
 
+struct WalWriteContext {
+    buf_wrap: BufWrap,
+    len: usize,
+    written: usize,
+}
+
 fn key_tags(key: usize) -> usize {
     return key >> 48;
 }
@@ -71,6 +81,12 @@ fn tag_is_timer(tag: usize) -> bool {
     return (tag & 0x1) == 0x1;
 }
 
+struct WalQueueEntry {
+    entry: BufWrap,
+    offset: usize,
+    len: usize,
+}
+
 pub struct Reactor {
     listener: TcpListener,
     timespec: Timespec,
@@ -79,32 +95,92 @@ pub struct Reactor {
     token_alloc: Slab<Token>,
     context_alloc: Slab<Context>,
     redis: RedisHandler,
+    wal_file: File,
+    wal_write: Option<WalWriteContext>,
+    wal_token_index: usize,
+    wal_backlog: VecDeque<WalQueueEntry>,
+}
+
+#[derive(Clone)]
+pub struct ReactorOptions {
+    pub wal_file: std::path::PathBuf,
+}
+
+impl ReactorOptions {
+    fn new() -> ReactorOptions {
+        return ReactorOptions {
+            wal_file: std::path::PathBuf::from("wal_log.dat"),
+        }
+    }
 }
 
 impl Reactor {
     pub fn new() ->anyhow::Result<Reactor> {
         let listener = TcpListener::bind(("127.0.0.1", 3456))?;
-        return Reactor::new_with_listener(listener);
+        return Reactor::new_with_listener(listener, ReactorOptions::new());
     }
 
-    pub fn new_with_listener(listener: TcpListener) -> anyhow::Result<Reactor> {
+    pub fn new_with_listener(listener: TcpListener, options: ReactorOptions) -> anyhow::Result<Reactor> {
         let backlog = VecDeque::new();
-        let token_alloc = Slab::with_capacity(64);
+        let mut token_alloc = Slab::with_capacity(64);
 
         println!("listen {}", listener.local_addr()?);
 
+        let wal_token_index = token_alloc.insert(Token::WalWrite);
 
         let timespec: Timespec = Timespec::new().sec(300).nsec(1000000);
+
+        let mut redis_handler = RedisHandler::new();
+        let buf_alloc = make_buffer_pool_allocator();
+
+        Reactor::restore_redis_from_wal(&mut redis_handler, buf_alloc.clone(), &options);
 
         return Ok(Reactor {
             listener,
             timespec,
             backlog,
-            buf_alloc: make_buffer_pool_allocator(),
+            buf_alloc,
             token_alloc,
             context_alloc: Slab::with_capacity(64),
-            redis: RedisHandler::new(),
+            redis: redis_handler,
+            wal_file: OpenOptions::new().write(true).create(true).append(true).open(options.wal_file)
+                .expect("Failed to open WAL log"),
+            wal_write: Option::None,
+            wal_token_index,
+            wal_backlog: VecDeque::new(),
         })
+    }
+
+    fn restore_redis_from_wal(redis_handler: &mut RedisHandler, mut buf_alloc: BufferPoolAllocator,
+                              options: &ReactorOptions) {
+        match File::open(&options.wal_file) {
+            Err(_) => {
+                println!("No WAL file found, not restoring any data");
+                return
+            },
+            Ok(mut file) => {
+                println!("Loading WAL ...");
+                let mut content = vec![];
+                file.read_to_end(&mut content).unwrap();
+
+                let mut offset = 0;
+
+                while offset < content.len() {
+                    match redis_handler.handle_data_from_slice(&mut buf_alloc, &content[offset..])  {
+                        HandleResult::NotEnoughData => {
+                            println!("WARN: WAL is truncated");
+                            return;
+                        },
+                        HandleResult::Processed((_write_buf, _bytes_written, bytes_consumed, _write_wal)) => {
+                            offset += bytes_consumed;
+                        },
+                        HandleResult::Error => {
+                            panic!("Got redis protocol error when reading WAL");
+                        }
+                    }
+                }
+            },
+        };
     }
 
     fn enqueue_read(&mut self, sq: &mut SubmissionQueue, token_index: usize, fd: RawFd,
@@ -160,24 +236,59 @@ impl Reactor {
         }
     }
 
+    fn handle_wal_write(&mut self, sq: &mut SubmissionQueue, buf_wrap: BufWrap, offset: usize, len: usize) {
+        if self.wal_write.is_none() {
+            let wal_write_entry = opcode::Write::new(types::Fd(self.wal_file.as_raw_fd()),
+                                                    buf_wrap.borrow().buf.as_ref().unwrap()[offset..].as_ptr(), len as _)
+                .build()
+                .user_data(self.wal_token_index as _);
+
+            unsafe {
+                if sq.push(&wal_write_entry).is_err() {
+                    self.backlog.push_back(wal_write_entry);
+                }
+            }
+
+            self.wal_write = Option::Some(WalWriteContext{
+                len,
+                written: offset,
+                buf_wrap,
+            });
+        } else {
+            self.wal_backlog.push_back(WalQueueEntry{
+                len,
+                offset,
+                entry: buf_wrap,
+            });
+        }
+    }
+
     fn handle_data(&mut self, mut sq: &mut SubmissionQueue, fd: RawFd, context_index: usize) {
         let offset = self.context_alloc[context_index].read_buf_offset;
         let len= self.context_alloc[context_index].read_buf_len;
         let read_token_index = self.context_alloc[context_index].read_token_index;
 
-        match self.redis.handle_data(&mut self.buf_alloc, &self.context_alloc[context_index].read_buf, offset, len)  {
+        match self.redis.handle_data_from_buf_wrap(&mut self.buf_alloc,
+                                                   &self.context_alloc[context_index].read_buf,
+                                                   offset,
+                                                   len)  {
             HandleResult::NotEnoughData => {
                 self.context_alloc[context_index].read_buf_offset = offset + len;
 
                 self.enqueue_read(&mut sq, read_token_index, fd,
                                   context_index, offset + len);
             },
-            HandleResult::Processed((write_buf, bytes_written, bytes_consumed)) => {
+            HandleResult::Processed((write_buf, bytes_written, bytes_consumed, write_wal)) => {
+                if write_wal {
+                    self.handle_wal_write(&mut sq, self.context_alloc[context_index].read_buf.clone(),
+                                          self.context_alloc[context_index].read_buf_offset, bytes_consumed);
+                }
+
                 self.context_alloc[context_index].read_buf_len -= bytes_consumed;
                 self.context_alloc[context_index].read_buf_offset += bytes_consumed;
                 self.context_alloc[context_index].write_len = bytes_written;
                 self.context_alloc[context_index].write_buf_offset = 0;
-                self.context_alloc[context_index].write_buf = write_buf;
+                self.context_alloc[context_index].write_buf = write_buf.clone();
 
                 self.enqueue_write(&mut sq, fd, self.context_alloc[context_index].write_token_index,
                                    context_index, 0, bytes_written);
@@ -354,6 +465,43 @@ impl Reactor {
                             }
                         }
                     }
+                    Token::WalWrite => {
+                        if ret <= 0 {
+                            panic!("Wal write failed, aborting ...");
+                        }
+
+                        let wal_written = ret as usize;
+                        let offset = wal_written + self.wal_write.as_ref().unwrap().written;
+                        let len = self.wal_write.as_ref().unwrap().len;
+                        let buf_wrap = self.wal_write.as_ref().unwrap().buf_wrap.clone();
+
+                        if offset < len {
+                            let to_write = len - offset;
+                            let wal_write_entry = opcode::Write::new(types::Fd(self.wal_file.as_raw_fd()),
+                                 buf_wrap.borrow().buf.as_ref().unwrap()[offset..].as_ptr(), to_write as _)
+                                .build()
+                                .user_data(self.wal_token_index as _);
+
+                            unsafe {
+                                if sq.push(&wal_write_entry).is_err() {
+                                    self.backlog.push_back(wal_write_entry);
+                                }
+                            }
+
+                            self.wal_write = Option::Some(WalWriteContext{
+                                len,
+                                written: offset,
+                                buf_wrap,
+                            });
+                        } else {
+                            self.wal_write = Option::None;
+
+                            if !self.wal_backlog.is_empty() {
+                                let queue_entry = self.wal_backlog.pop_front().unwrap();
+                                self.handle_wal_write(&mut sq, queue_entry.entry, queue_entry.offset, queue_entry.len);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -362,7 +510,7 @@ impl Reactor {
 
 #[cfg(test)]
 mod tests {
-    use crate::reactor::Reactor;
+    use crate::reactor::{Reactor, ReactorOptions};
     use std::net::{TcpStream, TcpListener};
     use std::io::{Write, Read};
 
@@ -370,16 +518,24 @@ mod tests {
     fn basic_smoke_test() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let options = ReactorOptions {
+            wal_file: tmp_dir.path().join("wal_log"),
+        };
+
+        let wal_path = options.wal_file.clone();
 
         std::thread::spawn(move || {
-            let mut reactor = Reactor::new_with_listener(listener).unwrap();
+            let mut reactor = Reactor::new_with_listener(listener, options).unwrap();
             reactor.run().unwrap();
         });
 
         let mut sock = TcpStream::connect(("localhost", port)).unwrap();
 
+        let set_string = "*3\r\n$3\r\nSET\r\n$4\r\nswag\r\n$4\r\nyolo\r\n";
+
         {
-            sock.write_all("*3\r\n$3\r\nSET\r\n$4\r\nswag\r\n$4\r\nyolo\r\n".as_bytes()).unwrap();
+            sock.write_all(set_string.as_bytes()).unwrap();
             let mut buf: [u8; 1000] = [0; 1000];
             let bytes_read = sock.read(&mut buf).unwrap();
 
@@ -399,21 +555,31 @@ mod tests {
             assert_eq!(bytes_read, expected_response.len());
             assert_eq!(expected_response.as_bytes()[..], buf[..bytes_read]);
         }
+
+        assert_eq!(std::fs::read_to_string(wal_path.as_path()).unwrap(), set_string);
     }
 
     #[test]
     fn test_pipeline() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let options = ReactorOptions {
+            wal_file: tmp_dir.path().join("wal_log"),
+        };
+
+        let wal_path = options.wal_file.clone();
 
         std::thread::spawn(move || {
-            let mut reactor = Reactor::new_with_listener(listener).unwrap();
+            let mut reactor = Reactor::new_with_listener(listener, options).unwrap();
             reactor.run().unwrap();
         });
 
         let mut sock = TcpStream::connect(("localhost", port)).unwrap();
 
-        sock.write_all("*3\r\n$3\r\nSET\r\n$4\r\nswag\r\n$4\r\nyolo\r\n*2\r\n$3\r\nGET\r\n$4\r\nswag\r\n".as_bytes()).unwrap();
+        let set_string = "*3\r\n$3\r\nSET\r\n$4\r\nswag\r\n$4\r\nyolo\r\n";
+
+        sock.write_all((set_string.to_owned() + "*2\r\n$3\r\nGET\r\n$4\r\nswag\r\n").as_bytes()).unwrap();
 
         {
             let mut buf: [u8; 1000] = [0; 1000];
@@ -427,6 +593,8 @@ mod tests {
             assert_eq!(bytes_read, expected_response.len());
             assert_eq!(expected_response.as_bytes()[..], buf[..bytes_read]);
         }
+
+        assert_eq!(std::fs::read_to_string(wal_path.as_path()).unwrap(), set_string);
     }
 
     // TODO: test partial command
