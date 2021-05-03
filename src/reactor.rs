@@ -16,7 +16,7 @@ use std::io::Read;
 
 extern crate redis_protocol;
 
-
+// user data for io-uring calls, tracks which operation completed and links back to the context
 #[derive(Clone, Debug)]
 enum Token {
     Accept,
@@ -65,22 +65,6 @@ struct WalWriteContext {
     written: usize,
 }
 
-fn key_tags(key: usize) -> usize {
-    return key >> 48;
-}
-
-fn key_without_tags(key: usize) -> usize {
-    return key & 0xffffffffffff
-}
-
-fn set_timer_on_key(key: usize) -> usize {
-    return key | (1 << 48);
-}
-
-fn tag_is_timer(tag: usize) -> bool {
-    return (tag & 0x1) == 0x1;
-}
-
 struct WalQueueEntry {
     entry: BufWrap,
     offset: usize,
@@ -96,9 +80,29 @@ pub struct Reactor {
     context_alloc: Slab<Context>,
     redis: RedisHandler,
     wal_file: File,
-    wal_write: Option<WalWriteContext>,
+    wal_write: Option<WalWriteContext>, // active WAL write
     wal_token_index: usize,
     wal_backlog: VecDeque<WalQueueEntry>,
+}
+
+// Helper functions so that we can encode some extra data in the io-uring user data together with the token index
+// We set bits in the upper 16 bits of the token index
+// So far mostly needed for timer io-uring calls. We use the same token index but set a timer flag bit
+
+fn key_tags(key: usize) -> usize {
+    return key >> 48;
+}
+
+fn key_without_tags(key: usize) -> usize {
+    return key & 0xffffffffffff
+}
+
+fn set_timer_on_key(key: usize) -> usize {
+    return key | (1 << 48);
+}
+
+fn tag_is_timer(tag: usize) -> bool {
+    return (tag & 0x1) == 0x1;
 }
 
 #[derive(Clone)]
