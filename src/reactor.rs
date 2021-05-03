@@ -109,7 +109,8 @@ impl Reactor {
 
     fn enqueue_read(&mut self, sq: &mut SubmissionQueue, token_index: usize, fd: RawFd,
         context_index: usize, offset: usize) {
-        let buf = &mut self.context_alloc[context_index].read_buf.buf.borrow_mut()[offset..];
+        let mut buf_borrow = self.context_alloc[context_index].read_buf.borrow_mut();
+        let buf = &mut buf_borrow.buf.as_mut().unwrap()[offset..];
         let read_e = opcode::Recv::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as _)
             .build()
             .flags(Flags::IO_LINK)
@@ -135,8 +136,8 @@ impl Reactor {
 
     fn enqueue_write(&mut self, sq: &mut SubmissionQueue, fd: RawFd, token_index: usize,
                      context_index: usize, offset: usize, len: usize) {
-
-        let buf = &self.context_alloc[context_index].write_buf.buf.borrow()[offset..];
+        let buf_borrow = self.context_alloc[context_index].write_buf.borrow();
+        let buf = &buf_borrow.buf.as_ref().unwrap()[offset..];
         let write_e = opcode::Send::new(types::Fd(fd), buf.as_ptr(), len as _)
             .build()
             .flags(Flags::IO_LINK)
