@@ -300,11 +300,7 @@ impl Reactor {
             HandleResult::Error => {
                 println!("Got redis protocol error, closing");
 
-                self.token_alloc.remove(read_token_index);
-
-                unsafe {
-                    libc::close(fd);
-                }
+                self.remove_connection(context_index);
             }
         }
     }
@@ -407,14 +403,7 @@ impl Reactor {
                                 io::Error::from_raw_os_error(-ret)
                             );
 
-                            unsafe {
-                                libc::close(self.context_alloc[context_index].fd);
-                            }
-
-                            self.token_alloc.remove(self.context_alloc[context_index].read_token_index);
-                            self.token_alloc.remove(self.context_alloc[context_index].write_token_index);
-                            self.context_alloc.remove(context_index);
-
+                            self.remove_connection(context_index);
                         } else {
                             self.context_alloc[context_index].read_buf_len += ret as usize;
                             self.handle_data(&mut sq, self.context_alloc[context_index].fd, context_index);
@@ -431,13 +420,8 @@ impl Reactor {
                             );
                             println!("shutdown");
 
-                            self.token_alloc.remove(self.context_alloc[context_index].read_token_index);
-                            self.token_alloc.remove(self.context_alloc[context_index].write_token_index);
-                            self.context_alloc.remove(context_index);
+                            self.remove_connection(context_index);
 
-                            unsafe {
-                                libc::close(self.context_alloc[context_index].fd);
-                            }
                         } else {
                             let write_len = ret as usize;
                             let offset = self.context_alloc[context_index].write_buf_offset;
@@ -509,6 +493,16 @@ impl Reactor {
                 }
             }
         }
+    }
+
+    fn remove_connection(self: &mut Self, context_index: usize) {
+        unsafe {
+            libc::close(self.context_alloc[context_index].fd);
+        }
+
+        self.token_alloc.remove(self.context_alloc[context_index].read_token_index);
+        self.token_alloc.remove(self.context_alloc[context_index].write_token_index);
+        self.context_alloc.remove(context_index);
     }
 }
 
