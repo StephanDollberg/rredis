@@ -41,34 +41,18 @@ struct Context {
     fd: RawFd,
 
     // buffer for read ops
-    read_buf: BufWrap,
-
-    // which offset are we at in the buffer
-    read_buf_offset: usize,
-
-    // how much data we have left starting from offset
-    read_buf_len: usize,
+    read_buf: BufWrapView,
 
     // buffer for write ops
-    write_buf: BufWrap,
-
-    // which offset are we at in the buffer
-    write_buf_offset: usize,
-
-    // how much data we have left starting from offset
-    write_len: usize,
+    write_buf: BufWrapView,
 }
 
 struct WalWriteContext {
-    buf_wrap: BufWrap,
-    len: usize,
-    written: usize,
+    buf_wrap: BufWrapView,
 }
 
 struct WalQueueEntry {
-    entry: BufWrap,
-    offset: usize,
-    len: usize,
+    entry: BufWrapView,
 }
 
 pub struct Reactor {
@@ -175,7 +159,7 @@ impl Reactor {
                             println!("WARN: WAL is truncated");
                             return;
                         },
-                        HandleResult::Processed((_write_buf, _bytes_written, bytes_consumed, _write_wal)) => {
+                        HandleResult::Processed((_write_buf, bytes_consumed, _write_wal)) => {
                             offset += bytes_consumed;
                         },
                         HandleResult::Error => {
@@ -188,9 +172,8 @@ impl Reactor {
     }
 
     fn enqueue_read(&mut self, sq: &mut SubmissionQueue, token_index: usize, fd: RawFd,
-        context_index: usize, offset: usize) {
-        let mut buf_borrow = self.context_alloc[context_index].read_buf.borrow_mut();
-        let buf = &mut buf_borrow.buf.as_mut().unwrap()[offset..];
+        context_index: usize) {
+        let mut buf = self.context_alloc[context_index].read_buf.write_view();
         let read_e = opcode::Recv::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as _)
             .build()
             .flags(Flags::IO_LINK)
@@ -215,10 +198,10 @@ impl Reactor {
     }
 
     fn enqueue_write(&mut self, sq: &mut SubmissionQueue, fd: RawFd, token_index: usize,
-                     context_index: usize, offset: usize, len: usize) {
-        let buf_borrow = self.context_alloc[context_index].write_buf.borrow();
-        let buf = &buf_borrow.buf.as_ref().unwrap()[offset..];
-        let write_e = opcode::Send::new(types::Fd(fd), buf.as_ptr(), len as _)
+                     context_index: usize) {
+        let buf = self.context_alloc[context_index].write_buf.read_view();
+        // let buf = &buf_borrow.buf.as_ref().unwrap()[offset..];
+        let write_e = opcode::Send::new(types::Fd(fd), buf.as_ptr(), buf.len() as _)
             .build()
             .flags(Flags::IO_LINK)
             .user_data(token_index as _);
@@ -240,62 +223,50 @@ impl Reactor {
         }
     }
 
-    fn handle_wal_write(&mut self, sq: &mut SubmissionQueue, buf_wrap: BufWrap, offset: usize, len: usize) {
+    fn handle_wal_write(&mut self, sq: &mut SubmissionQueue, buf_wrap: BufWrapView) {
         if self.wal_write.is_none() {
-            let wal_write_entry = opcode::Write::new(types::Fd(self.wal_file.as_raw_fd()),
-                                                    buf_wrap.borrow().buf.as_ref().unwrap()[offset..].as_ptr(), len as _)
-                .build()
-                .user_data(self.wal_token_index as _);
+            {
+                let buf = buf_wrap.read_view();
+                let wal_write_entry = opcode::Write::new(types::Fd(self.wal_file.as_raw_fd()),
+                                                         buf.as_ptr(), buf.len() as _)
+                    .build()
+                    .user_data(self.wal_token_index as _);
 
-            unsafe {
-                if sq.push(&wal_write_entry).is_err() {
-                    self.backlog.push_back(wal_write_entry);
+                unsafe {
+                    if sq.push(&wal_write_entry).is_err() {
+                        self.backlog.push_back(wal_write_entry);
+                    }
                 }
             }
 
             self.wal_write = Option::Some(WalWriteContext{
-                len,
-                written: offset,
                 buf_wrap,
             });
         } else {
             self.wal_backlog.push_back(WalQueueEntry{
-                len,
-                offset,
                 entry: buf_wrap,
             });
         }
     }
 
     fn handle_data(&mut self, mut sq: &mut SubmissionQueue, fd: RawFd, context_index: usize) {
-        let offset = self.context_alloc[context_index].read_buf_offset;
-        let len= self.context_alloc[context_index].read_buf_len;
         let read_token_index = self.context_alloc[context_index].read_token_index;
 
         match self.redis.handle_data_from_buf_wrap(&mut self.buf_alloc,
-                                                   &self.context_alloc[context_index].read_buf,
-                                                   offset,
-                                                   len)  {
+                                                   &self.context_alloc[context_index].read_buf)  {
             HandleResult::NotEnoughData => {
-                self.context_alloc[context_index].read_buf_offset = offset + len;
-
-                self.enqueue_read(&mut sq, read_token_index, fd,
-                                  context_index, offset + len);
+                self.enqueue_read(&mut sq, read_token_index, fd, context_index);
             },
-            HandleResult::Processed((write_buf, bytes_written, bytes_consumed, write_wal)) => {
+            HandleResult::Processed((write_buf, bytes_consumed, write_wal)) => {
                 if write_wal {
-                    self.handle_wal_write(&mut sq, self.context_alloc[context_index].read_buf.clone(),
-                                          self.context_alloc[context_index].read_buf_offset, bytes_consumed);
+                    self.handle_wal_write(&mut sq, self.context_alloc[context_index].read_buf.sub_read_buf(bytes_consumed));
                 }
 
-                self.context_alloc[context_index].read_buf_len -= bytes_consumed;
-                self.context_alloc[context_index].read_buf_offset += bytes_consumed;
-                self.context_alloc[context_index].write_len = bytes_written;
-                self.context_alloc[context_index].write_buf_offset = 0;
+                self.context_alloc[context_index].read_buf.advance_read(bytes_consumed);
                 self.context_alloc[context_index].write_buf = write_buf.clone();
 
                 self.enqueue_write(&mut sq, fd, self.context_alloc[context_index].write_token_index,
-                                   context_index, 0, bytes_written);
+                                   context_index);
             },
             HandleResult::Error => {
                 println!("Got redis protocol error, closing");
@@ -375,23 +346,20 @@ impl Reactor {
 
                         let fd = ret;
 
+                        let read_buf = allocate_buf(self.buf_alloc.clone());
                         let context_index = self.context_alloc.insert(Context{
                             read_token_index: 0,
                             write_token_index: 0,
                             fd,
-                            read_buf: allocate_buf(self.buf_alloc.clone()),
-                            read_buf_offset: 0,
-                            read_buf_len: 0,
-                            write_buf: allocate_buf(self.buf_alloc.clone()),
-                            write_buf_offset: 0,
-                            write_len: 0,
+                            read_buf: BufWrapView::from_buf_wrap(read_buf),
+                            // inited but never used
+                            write_buf: BufWrapView::from_buf_wrap(allocate_buf(self.buf_alloc.clone())),
                         });
 
                         self.context_alloc[context_index].read_token_index = self.token_alloc.insert(Token::Read(context_index));
                         self.context_alloc[context_index].write_token_index = self.token_alloc.insert(Token::Write(context_index));
 
-                        self.enqueue_read(&mut sq, self.context_alloc[context_index].read_token_index, fd,
-                                          context_index, 0);
+                        self.enqueue_read(&mut sq, self.context_alloc[context_index].read_token_index, fd, context_index);
                     }
                     Token::Read(context_index) => {
                         println!("read context {:?}", self.context_alloc[context_index]);
@@ -405,7 +373,7 @@ impl Reactor {
 
                             self.remove_connection(context_index);
                         } else {
-                            self.context_alloc[context_index].read_buf_len += ret as usize;
+                            self.context_alloc[context_index].read_buf.advance_write(ret as usize);
                             self.handle_data(&mut sq, self.context_alloc[context_index].fd, context_index);
                         }
                     }
@@ -424,31 +392,26 @@ impl Reactor {
 
                         } else {
                             let write_len = ret as usize;
-                            let offset = self.context_alloc[context_index].write_buf_offset;
+                            self.context_alloc[context_index].write_buf.advance_read(write_len);
 
                             // incomplete write
-                            if offset + write_len < self.context_alloc[context_index].write_len {
-                                let offset = offset + write_len;
-                                let len = write_len - offset;
-
+                            if self.context_alloc[context_index].write_buf.is_open() {
                                 *token = Token::Write(context_index);
-                                self.context_alloc[context_index].write_buf_offset = offset;
-                                self.context_alloc[context_index].write_len = len;
 
                                 self.enqueue_write(&mut sq, self.context_alloc[context_index].fd, token_index,
-                                                   context_index, offset, len);
+                                                   context_index);
                             } else {
                                 // there is more unprocessed data
-                                if self.context_alloc[context_index].read_buf_len != 0 {
+                                if self.context_alloc[context_index].read_buf.is_open() {
                                     self.handle_data(&mut sq, self.context_alloc[context_index].fd, context_index);
                                 }
                                 // read new request
                                 else {
-                                    self.context_alloc[context_index].read_buf_offset = 0;
+                                    self.context_alloc[context_index].read_buf = BufWrapView::from_buf_wrap(
+                                        allocate_buf(self.buf_alloc.clone()));
 
                                     self.enqueue_read(&mut sq, self.context_alloc[context_index].read_token_index,
-                                        self.context_alloc[context_index].fd, context_index,
-                                        self.context_alloc[context_index].read_buf_offset);
+                                        self.context_alloc[context_index].fd, context_index);
                                 }
                             }
                         }
@@ -459,14 +422,12 @@ impl Reactor {
                         }
 
                         let wal_written = ret as usize;
-                        let offset = wal_written + self.wal_write.as_ref().unwrap().written;
-                        let len = self.wal_write.as_ref().unwrap().len;
-                        let buf_wrap = self.wal_write.as_ref().unwrap().buf_wrap.clone();
+                        let mut buf_wrap = self.wal_write.as_ref().unwrap().buf_wrap.clone();
+                        buf_wrap.advance_read(wal_written);
 
-                        if offset < len {
-                            let to_write = len - offset;
+                        if buf_wrap.is_open() {
                             let wal_write_entry = opcode::Write::new(types::Fd(self.wal_file.as_raw_fd()),
-                                 buf_wrap.borrow().buf.as_ref().unwrap()[offset..].as_ptr(), to_write as _)
+                                 buf_wrap.read_view().as_ptr(), buf_wrap.read_view().len() as _)
                                 .build()
                                 .user_data(self.wal_token_index as _);
 
@@ -476,17 +437,12 @@ impl Reactor {
                                 }
                             }
 
-                            self.wal_write = Option::Some(WalWriteContext{
-                                len,
-                                written: offset,
-                                buf_wrap,
-                            });
                         } else {
                             self.wal_write = Option::None;
 
                             if !self.wal_backlog.is_empty() {
                                 let queue_entry = self.wal_backlog.pop_front().unwrap();
-                                self.handle_wal_write(&mut sq, queue_entry.entry, queue_entry.offset, queue_entry.len);
+                                self.handle_wal_write(&mut sq, queue_entry.entry);
                             }
                         }
                     }
@@ -511,6 +467,8 @@ mod tests {
     use crate::reactor::{Reactor, ReactorOptions};
     use std::net::{TcpStream, TcpListener};
     use std::io::{Write, Read};
+    use std::thread::sleep;
+    use std::time::Duration;
 
     #[test]
     fn basic_smoke_test() {
@@ -590,6 +548,11 @@ mod tests {
 
             assert_eq!(bytes_read, expected_response.len());
             assert_eq!(expected_response.as_bytes()[..], buf[..bytes_read]);
+        }
+
+
+        while std::fs::read_to_string(wal_path.as_path()).unwrap().is_empty() {
+            sleep(Duration::from_millis(100))
         }
 
         assert_eq!(std::fs::read_to_string(wal_path.as_path()).unwrap(), set_string);

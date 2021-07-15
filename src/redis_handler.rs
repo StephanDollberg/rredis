@@ -7,7 +7,7 @@ type CommandHandler = fn(&mut RedisHandler, &Vec<redis_protocol::prelude::Frame>
 pub enum HandleResult {
     NotEnoughData,
     // buf_index to send, buf len, bytes consumed, write_wal, TODO make this a struct
-    Processed((BufWrap, usize, usize, bool)),
+    Processed((BufWrapView, usize, bool)),
     Error,
 }
 
@@ -40,7 +40,7 @@ impl RedisHandler {
             }
         };
 
-        return HandleResult::Processed((buffer, bytes_written, consumed, false));
+        return HandleResult::Processed((BufWrapView::filled_from_buf_wrap(buffer, bytes_written), consumed, false));
     }
 
     pub fn handle_set(&mut self, args: &Vec<redis_protocol::prelude::Frame>, buf_alloc: &mut BufferPoolAllocator, consumed: usize) -> HandleResult {
@@ -65,7 +65,7 @@ impl RedisHandler {
         let bytes_written = redis_protocol::prelude::encode(&mut buffer.borrow_mut().buf.as_mut().unwrap()[..],
                                                             &redis_protocol::prelude::Frame::SimpleString(String::from("OK"))).unwrap();
 
-        return HandleResult::Processed((buffer, bytes_written, consumed, true));
+        return HandleResult::Processed((BufWrapView::filled_from_buf_wrap(buffer, bytes_written), consumed, true));
     }
 
     pub fn handle_command(&mut self, _args: &Vec<redis_protocol::prelude::Frame>, buf_alloc: &mut BufferPoolAllocator, consumed: usize) -> HandleResult {
@@ -74,7 +74,7 @@ impl RedisHandler {
         let bytes_written = redis_protocol::prelude::encode(&mut buffer.borrow_mut().buf.as_mut().unwrap()[..],
                                                             &redis_protocol::prelude::Frame::Array(Vec::new())).unwrap();
 
-        return HandleResult::Processed((buffer, bytes_written, consumed, false));
+        return HandleResult::Processed((BufWrapView::filled_from_buf_wrap(buffer, bytes_written), consumed, false));
     }
 
     pub fn new() -> RedisHandler {
@@ -121,9 +121,8 @@ impl RedisHandler {
         }
     }
 
-    pub fn handle_data_from_buf_wrap(&mut self, mut buf_alloc: &mut BufferPoolAllocator, buffer: &BufWrap,
-                                     offset: usize, len: usize) -> HandleResult {
-        return self.handle_data_from_slice(&mut buf_alloc, &buffer.borrow().buf.as_ref().unwrap()[offset..offset+len]);
+    pub fn handle_data_from_buf_wrap(&mut self, mut buf_alloc: &mut BufferPoolAllocator, buffer: &BufWrapView) -> HandleResult {
+        return self.handle_data_from_slice(&mut buf_alloc, &buffer.read_view());
     }
 
     pub fn handle_data_from_slice(&mut self, mut buf_alloc: &mut BufferPoolAllocator, buffer: &[u8]) -> HandleResult {
@@ -158,16 +157,17 @@ mod tests {
         let mut allocator = make_buffer_pool_allocator();
 
         {
-            let buffer = allocate_buf(allocator.clone());
+            let mut buffer = BufWrapView::from_buf_wrap(allocate_buf(allocator.clone()));
             let set_data = "*3\r\n$3\r\nSET\r\n$4\r\nswag\r\n$4\r\nyolo\r\n";
-            buffer.borrow_mut().buf.as_mut().unwrap()[..set_data.len()].copy_from_slice(set_data.as_bytes());
+            buffer.write_view()[..set_data.len()].copy_from_slice(set_data.as_bytes());
+            buffer.advance_write(set_data.len());
 
-            match handler.handle_data_from_buf_wrap(&mut allocator, &buffer, 0, set_data.len()) {
-                HandleResult::Processed((write_buffer, write_len, bytes_consumed, _wal)) => {
+            match handler.handle_data_from_buf_wrap(&mut allocator, &buffer) {
+                HandleResult::Processed((write_buffer, bytes_consumed, _wal)) => {
                     assert_eq!(bytes_consumed, set_data.len());
                     let ok_string = "+OK\r\n";
-                    assert_eq!(write_len, ok_string.len());
-                    assert_eq!(&write_buffer.borrow().buf.as_ref().unwrap()[..write_len], ok_string.as_bytes());
+                    assert_eq!(write_buffer.read_view().len(), ok_string.len());
+                    assert_eq!(*write_buffer.read_view(), *ok_string.as_bytes());
                 }
                 _ => {
                     assert!(false, "got wrong HandleResult");
@@ -176,16 +176,17 @@ mod tests {
         }
 
         {
-            let buffer = allocate_buf(allocator.clone());
+            let mut buffer = BufWrapView::from_buf_wrap(allocate_buf(allocator.clone()));
             let get_data = "*2\r\n$3\r\nGET\r\n$4\r\nswag\r\n";
-            buffer.borrow_mut().buf.as_mut().unwrap()[..get_data.len()].copy_from_slice(get_data.as_bytes());
+            buffer.write_view()[..get_data.len()].copy_from_slice(get_data.as_bytes());
+            buffer.advance_write(get_data.len());
 
-            match handler.handle_data_from_buf_wrap(&mut allocator, &buffer, 0, get_data.len()) {
-                HandleResult::Processed((write_buffer, write_len, bytes_consumed, _wal)) => {
+            match handler.handle_data_from_buf_wrap(&mut allocator, &buffer) {
+                HandleResult::Processed((write_buffer, bytes_consumed, _wal)) => {
                     assert_eq!(bytes_consumed, get_data.len());
                     let resp_string = "$4\r\nyolo\r\n";
-                    assert_eq!(write_len, resp_string.len());
-                    assert_eq!(&write_buffer.borrow().buf.as_ref().unwrap()[..write_len], resp_string.as_bytes());
+                    assert_eq!(write_buffer.read_view().len(), resp_string.len());
+                    assert_eq!(*write_buffer.read_view(), *resp_string.as_bytes());
                 }
                 _ => {
                     assert!(false, "got wrong HandleResult");
