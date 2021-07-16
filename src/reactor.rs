@@ -44,7 +44,7 @@ struct Context {
     read_buf: BufWrapView,
 
     // buffer for write ops
-    write_buf: BufWrapView,
+    write_buf: Option<BufWrapView>,
 }
 
 struct WalWriteContext {
@@ -199,8 +199,7 @@ impl Reactor {
 
     fn enqueue_write(&mut self, sq: &mut SubmissionQueue, fd: RawFd, token_index: usize,
                      context_index: usize) {
-        let buf = self.context_alloc[context_index].write_buf.read_view();
-        // let buf = &buf_borrow.buf.as_ref().unwrap()[offset..];
+        let buf = self.context_alloc[context_index].write_buf.as_ref().unwrap().read_view();
         let write_e = opcode::Send::new(types::Fd(fd), buf.as_ptr(), buf.len() as _)
             .build()
             .flags(Flags::IO_LINK)
@@ -263,7 +262,7 @@ impl Reactor {
                 }
 
                 self.context_alloc[context_index].read_buf.advance_read(bytes_consumed);
-                self.context_alloc[context_index].write_buf = write_buf.clone();
+                self.context_alloc[context_index].write_buf = Option::Some(write_buf.clone());
 
                 self.enqueue_write(&mut sq, fd, self.context_alloc[context_index].write_token_index,
                                    context_index);
@@ -353,7 +352,7 @@ impl Reactor {
                             fd,
                             read_buf: BufWrapView::from_buf_wrap(read_buf),
                             // inited but never used
-                            write_buf: BufWrapView::from_buf_wrap(allocate_buf(self.buf_alloc.clone())),
+                            write_buf: Option::None,
                         });
 
                         self.context_alloc[context_index].read_token_index = self.token_alloc.insert(Token::Read(context_index));
@@ -392,10 +391,10 @@ impl Reactor {
 
                         } else {
                             let write_len = ret as usize;
-                            self.context_alloc[context_index].write_buf.advance_read(write_len);
+                            self.context_alloc[context_index].write_buf.as_mut().unwrap().advance_read(write_len);
 
                             // incomplete write
-                            if self.context_alloc[context_index].write_buf.is_open() {
+                            if self.context_alloc[context_index].write_buf.as_ref().unwrap().is_open() {
                                 *token = Token::Write(context_index);
 
                                 self.enqueue_write(&mut sq, self.context_alloc[context_index].fd, token_index,
@@ -409,6 +408,7 @@ impl Reactor {
                                 else {
                                     self.context_alloc[context_index].read_buf = BufWrapView::from_buf_wrap(
                                         allocate_buf(self.buf_alloc.clone()));
+                                    self.context_alloc[context_index].write_buf = Option::None;
 
                                     self.enqueue_read(&mut sq, self.context_alloc[context_index].read_token_index,
                                         self.context_alloc[context_index].fd, context_index);
