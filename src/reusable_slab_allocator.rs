@@ -75,12 +75,12 @@ pub struct BufWrapView {
 impl BufWrapView {
     pub fn read_view(&self) -> impl Deref<Target = [u8]> + '_ {
         return Ref::map(self.buf.deref().borrow(),
-                        |rc| &rc.buf.as_ref().unwrap()[self.read_offset..self.write_offset]);
+                        |bwi| &bwi.buf.as_ref().unwrap()[self.read_offset..self.write_offset]);
     }
 
     pub fn write_view(&mut self) -> impl DerefMut<Target = [u8]> + '_ {
         return RefMut::map(self.buf.deref().borrow_mut(),
-                        |rc| &mut rc.buf.as_mut().unwrap()[self.write_offset..]);
+                        |bwi| &mut bwi.buf.as_mut().unwrap()[self.write_offset..]);
     }
 
     pub fn is_open(&self) -> bool {
