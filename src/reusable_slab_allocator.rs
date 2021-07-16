@@ -123,10 +123,7 @@ impl BufWrapView {
 
 impl fmt::Debug for BufWrapView {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut addr = 0 as *const u8;
-        if self.read_view().len() > 0 {
-            addr = &self.read_view()[0] as *const u8;
-        }
+        let addr = &self.buf.deref().borrow().buf.as_ref().unwrap()[0] as *const u8;
         f.debug_struct("BufWrapView")
             .field("addr", & (addr as *const u8 ))
             .field("read_offset", &self.read_offset)
