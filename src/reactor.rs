@@ -276,6 +276,126 @@ impl Reactor {
         }
     }
 
+    fn on_token_accpet(&mut self, token_index: usize, return_val: i32, mut sq: &mut SubmissionQueue) {
+        println!("accept");
+
+        // enqueue new accept
+        let accept_e = opcode::Accept::new(types::Fd(self.listener.as_raw_fd()), ptr::null_mut(), ptr::null_mut())
+            .build()
+            .user_data(token_index as _);
+
+        unsafe {
+            sq.push(&accept_e).expect("Couldn't push first accept to queue. Something is wrong");
+        }
+
+        // enqueue read
+
+        let fd = return_val;
+
+        let read_buf = allocate_buf(self.buf_alloc.clone());
+        let context_index = self.context_alloc.insert(Context{
+            read_token_index: 0,
+            write_token_index: 0,
+            fd,
+            read_buf: BufWrapView::from_buf_wrap(read_buf),
+            // inited but never used
+            write_buf: Option::None,
+        });
+
+        self.context_alloc[context_index].read_token_index = self.token_alloc.insert(Token::Read(context_index));
+        self.context_alloc[context_index].write_token_index = self.token_alloc.insert(Token::Write(context_index));
+
+        self.enqueue_read(&mut sq, self.context_alloc[context_index].read_token_index, fd, context_index);
+    }
+
+    fn on_token_read(&mut self, context_index: usize, return_val: i32, mut sq: &mut SubmissionQueue) {
+        println!("read context {:?}", self.context_alloc[context_index]);
+        if return_val <= 0 {
+            eprintln!(
+                "closing context {:?} ret {:?} error: {:?}",
+                context_index,
+                return_val,
+                io::Error::from_raw_os_error(-return_val)
+            );
+
+            self.remove_connection(context_index);
+        } else {
+            self.context_alloc[context_index].read_buf.advance_write(return_val as usize);
+            self.handle_data(&mut sq, self.context_alloc[context_index].fd, context_index);
+        }
+    }
+
+    fn on_token_write(&mut self, context_index: usize, return_val: i32, mut sq: &mut SubmissionQueue) {
+        println!("write context {:?}", self.context_alloc[context_index]);
+        if return_val <= 0 {
+            eprintln!(
+                "token {:?} return_val {:?} error: {:?}",
+                context_index,
+                return_val,
+                io::Error::from_raw_os_error(-return_val)
+            );
+            println!("shutdown");
+
+            self.remove_connection(context_index);
+
+        } else {
+            let write_len = return_val as usize;
+            self.context_alloc[context_index].write_buf.as_mut().unwrap().advance_read(write_len);
+
+            // incomplete write
+            if self.context_alloc[context_index].write_buf.as_ref().unwrap().is_open() {
+                self.enqueue_write(&mut sq, self.context_alloc[context_index].fd,
+                                   self.context_alloc[context_index].write_token_index,
+                                   context_index);
+            } else {
+                // there is more unprocessed data
+                if self.context_alloc[context_index].read_buf.is_open() {
+                    self.handle_data(&mut sq, self.context_alloc[context_index].fd, context_index);
+                }
+                // read new request
+                else {
+                    self.context_alloc[context_index].read_buf = BufWrapView::from_buf_wrap(
+                        allocate_buf(self.buf_alloc.clone()));
+                    self.context_alloc[context_index].write_buf = Option::None;
+
+                    self.enqueue_read(&mut sq, self.context_alloc[context_index].read_token_index,
+                                      self.context_alloc[context_index].fd, context_index);
+                }
+            }
+        }
+    }
+
+    fn on_token_wal_write(&mut self, return_val: i32, mut sq: &mut SubmissionQueue) {
+        if return_val <= 0 {
+            panic!("Wal write failed, aborting ...");
+        }
+
+        let wal_written = return_val as usize;
+        let mut buf_wrap = self.wal_write.as_ref().unwrap().buf_wrap.clone();
+        buf_wrap.advance_read(wal_written);
+
+        if buf_wrap.is_open() {
+            let wal_write_entry = opcode::Write::new(types::Fd(self.wal_file.as_raw_fd()),
+                                                     buf_wrap.read_view().as_ptr(), buf_wrap.read_view().len() as _)
+                .build()
+                .user_data(self.wal_token_index as _);
+
+            unsafe {
+                if sq.push(&wal_write_entry).is_err() {
+                    self.backlog.push_back(wal_write_entry);
+                }
+            }
+
+        } else {
+            self.wal_write = Option::None;
+
+            if !self.wal_backlog.is_empty() {
+                let queue_entry = self.wal_backlog.pop_front().unwrap();
+                self.handle_wal_write(&mut sq, queue_entry.entry);
+            }
+        }
+    }
+
     pub fn run(&mut self) -> anyhow::Result<()> {
         // TODO move this out so that we can just run in lockstep
         // Needs fighting with lifetimes
@@ -331,121 +451,16 @@ impl Reactor {
                 println!("token {:?}", token);
                 match token.clone() {
                     Token::Accept => {
-                        println!("accept");
-
-                        // enqueue new accept
-                        let accept_e = opcode::Accept::new(types::Fd(self.listener.as_raw_fd()), ptr::null_mut(), ptr::null_mut())
-                            .build()
-                            .user_data(token_index as _);
-
-                        unsafe {
-                            sq.push(&accept_e).expect("Couldn't push first accept to queue. Something is wrong");
-                        }
-
-                        // enqueue read
-
-                        let fd = ret;
-
-                        let read_buf = allocate_buf(self.buf_alloc.clone());
-                        let context_index = self.context_alloc.insert(Context{
-                            read_token_index: 0,
-                            write_token_index: 0,
-                            fd,
-                            read_buf: BufWrapView::from_buf_wrap(read_buf),
-                            // inited but never used
-                            write_buf: Option::None,
-                        });
-
-                        self.context_alloc[context_index].read_token_index = self.token_alloc.insert(Token::Read(context_index));
-                        self.context_alloc[context_index].write_token_index = self.token_alloc.insert(Token::Write(context_index));
-
-                        self.enqueue_read(&mut sq, self.context_alloc[context_index].read_token_index, fd, context_index);
+                        self.on_token_accpet(token_index, ret, &mut sq);
                     }
                     Token::Read(context_index) => {
-                        println!("read context {:?}", self.context_alloc[context_index]);
-                        if ret <= 0 {
-                            eprintln!(
-                                "closing token {:?} ret {:?} error: {:?}",
-                                self.token_alloc.get(token_index),
-                                ret,
-                                io::Error::from_raw_os_error(-ret)
-                            );
-
-                            self.remove_connection(context_index);
-                        } else {
-                            self.context_alloc[context_index].read_buf.advance_write(ret as usize);
-                            self.handle_data(&mut sq, self.context_alloc[context_index].fd, context_index);
-                        }
+                        self.on_token_read(context_index, ret, &mut sq);
                     }
                     Token::Write(context_index) => {
-                        println!("write context {:?}", self.context_alloc[context_index]);
-                        if ret <= 0 {
-                            eprintln!(
-                                "token {:?} ret {:?} error: {:?}",
-                                self.token_alloc.get(token_index),
-                                ret,
-                                io::Error::from_raw_os_error(-ret)
-                            );
-                            println!("shutdown");
-
-                            self.remove_connection(context_index);
-
-                        } else {
-                            let write_len = ret as usize;
-                            self.context_alloc[context_index].write_buf.as_mut().unwrap().advance_read(write_len);
-
-                            // incomplete write
-                            if self.context_alloc[context_index].write_buf.as_ref().unwrap().is_open() {
-                                *token = Token::Write(context_index);
-
-                                self.enqueue_write(&mut sq, self.context_alloc[context_index].fd, token_index,
-                                                   context_index);
-                            } else {
-                                // there is more unprocessed data
-                                if self.context_alloc[context_index].read_buf.is_open() {
-                                    self.handle_data(&mut sq, self.context_alloc[context_index].fd, context_index);
-                                }
-                                // read new request
-                                else {
-                                    self.context_alloc[context_index].read_buf = BufWrapView::from_buf_wrap(
-                                        allocate_buf(self.buf_alloc.clone()));
-                                    self.context_alloc[context_index].write_buf = Option::None;
-
-                                    self.enqueue_read(&mut sq, self.context_alloc[context_index].read_token_index,
-                                        self.context_alloc[context_index].fd, context_index);
-                                }
-                            }
-                        }
+                        self.on_token_write(context_index, ret, &mut sq);
                     }
                     Token::WalWrite => {
-                        if ret <= 0 {
-                            panic!("Wal write failed, aborting ...");
-                        }
-
-                        let wal_written = ret as usize;
-                        let mut buf_wrap = self.wal_write.as_ref().unwrap().buf_wrap.clone();
-                        buf_wrap.advance_read(wal_written);
-
-                        if buf_wrap.is_open() {
-                            let wal_write_entry = opcode::Write::new(types::Fd(self.wal_file.as_raw_fd()),
-                                 buf_wrap.read_view().as_ptr(), buf_wrap.read_view().len() as _)
-                                .build()
-                                .user_data(self.wal_token_index as _);
-
-                            unsafe {
-                                if sq.push(&wal_write_entry).is_err() {
-                                    self.backlog.push_back(wal_write_entry);
-                                }
-                            }
-
-                        } else {
-                            self.wal_write = Option::None;
-
-                            if !self.wal_backlog.is_empty() {
-                                let queue_entry = self.wal_backlog.pop_front().unwrap();
-                                self.handle_wal_write(&mut sq, queue_entry.entry);
-                            }
-                        }
+                        self.on_token_wal_write(ret, &mut sq);
                     }
                 }
             }
