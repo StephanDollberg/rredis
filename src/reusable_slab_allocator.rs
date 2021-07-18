@@ -5,7 +5,7 @@ use std::ops::Deref;
 use std::ops::DerefMut;
 
 pub struct BufferPoolAllocatorImpl {
-    bufpool: Vec<Box<[u8]>>,
+    bufpool: Vec<Vec<u8>>,
 }
 
 impl BufferPoolAllocatorImpl {
@@ -15,16 +15,16 @@ impl BufferPoolAllocatorImpl {
         }
     }
 
-    pub fn allocate_buf(&mut self) -> Box<[u8]> {
+    pub fn allocate_buf(&mut self) -> Vec<u8> {
         return match self.bufpool.pop() {
             Some(buf) =>buf,
             None => {
-                Box::from(vec![0u8; 2048])
+                vec![0u8; 2048]
             }
         };
     }
 
-    pub fn deallocate_buf(&mut self, buf: Box<[u8]>) {
+    pub fn deallocate_buf(&mut self, buf: Vec<u8>) {
         self.bufpool.push(buf);
     }
 }
@@ -37,13 +37,13 @@ pub fn make_buffer_pool_allocator() -> BufferPoolAllocator {
 
 #[derive(Clone)]
 pub struct BufWrapImpl {
-    pub buf: Option<Box<[u8]>>,
+    pub buf: Vec<u8>,
     allocator: BufferPoolAllocator,
 }
 
 impl Drop for BufWrapImpl {
     fn drop(&mut self) {
-        self.allocator.borrow_mut().deallocate_buf(std::mem::replace(&mut self.buf, Option::None).unwrap());
+        self.allocator.borrow_mut().deallocate_buf(std::mem::replace(&mut self.buf, Vec::<u8>::new()));
     }
 }
 
@@ -52,7 +52,7 @@ pub type BufWrap = Rc<RefCell<BufWrapImpl>>;
 impl fmt::Debug for BufWrapImpl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BufWrap")
-            .field("addr", & (&self.buf.as_ref().unwrap()[0] as *const u8))
+            .field("addr", & (&self.buf[0] as *const u8))
             .finish()
     }
 }
@@ -60,7 +60,7 @@ impl fmt::Debug for BufWrapImpl {
 pub fn allocate_buf(allocator: BufferPoolAllocator) -> BufWrap {
     let buf = allocator.borrow_mut().allocate_buf();
     return Rc::from(RefCell::new(BufWrapImpl {
-        buf: Option::Some(buf),
+        buf,
         allocator,
     }));
 }
@@ -75,12 +75,12 @@ pub struct BufWrapView {
 impl BufWrapView {
     pub fn read_view(&self) -> impl Deref<Target = [u8]> + '_ {
         return Ref::map(self.buf.deref().borrow(),
-                        |bwi| &bwi.buf.as_ref().unwrap()[self.read_offset..self.write_offset]);
+                        |bwi| &bwi.buf[self.read_offset..self.write_offset]);
     }
 
     pub fn write_view(&mut self) -> impl DerefMut<Target = [u8]> + '_ {
         return RefMut::map(self.buf.deref().borrow_mut(),
-                        |bwi| &mut bwi.buf.as_mut().unwrap()[self.write_offset..]);
+                        |bwi| &mut bwi.buf[self.write_offset..]);
     }
 
     pub fn is_open(&self) -> bool {
@@ -123,7 +123,7 @@ impl BufWrapView {
 
 impl fmt::Debug for BufWrapView {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let addr = &self.buf.deref().borrow().buf.as_ref().unwrap()[0] as *const u8;
+        let addr = &self.buf.deref().borrow().buf[0] as *const u8;
         f.debug_struct("BufWrapView")
             .field("addr", & (addr as *const u8 ))
             .field("read_offset", &self.read_offset)

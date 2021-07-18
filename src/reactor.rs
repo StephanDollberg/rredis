@@ -149,6 +149,7 @@ impl Reactor {
             Ok(mut file) => {
                 println!("Loading WAL ...");
                 let mut content = vec![];
+                // TODO: just mmap here
                 file.read_to_end(&mut content).unwrap();
 
                 let mut offset = 0;

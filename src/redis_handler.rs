@@ -31,11 +31,11 @@ impl RedisHandler {
 
         let bytes_written = match self.state.get(key) {
             Some(val) => {
-                redis_protocol::prelude::encode(&mut buffer.borrow_mut().buf.as_mut().unwrap()[..],
+                redis_protocol::prelude::encode(&mut buffer.borrow_mut().buf[..],
                                                 &redis_protocol::prelude::Frame::BulkString(val.clone())).unwrap()
             }
             None => {
-                redis_protocol::prelude::encode(&mut buffer.borrow_mut().buf.as_mut().unwrap()[..],
+                redis_protocol::prelude::encode(&mut buffer.borrow_mut().buf[..],
                                                 &redis_protocol::prelude::Frame::Null).unwrap()
             }
         };
@@ -62,7 +62,7 @@ impl RedisHandler {
 
         let buffer = allocate_buf(buf_alloc.clone());
 
-        let bytes_written = redis_protocol::prelude::encode(&mut buffer.borrow_mut().buf.as_mut().unwrap()[..],
+        let bytes_written = redis_protocol::prelude::encode(&mut buffer.borrow_mut().buf[..],
                                                             &redis_protocol::prelude::Frame::SimpleString(String::from("OK"))).unwrap();
 
         return HandleResult::Processed((BufWrapView::filled_from_buf_wrap(buffer, bytes_written), consumed, true));
@@ -71,7 +71,7 @@ impl RedisHandler {
     pub fn handle_command(&mut self, _args: &Vec<redis_protocol::prelude::Frame>, buf_alloc: &mut BufferPoolAllocator, consumed: usize) -> HandleResult {
         let buffer = allocate_buf(buf_alloc.clone());
 
-        let bytes_written = redis_protocol::prelude::encode(&mut buffer.borrow_mut().buf.as_mut().unwrap()[..],
+        let bytes_written = redis_protocol::prelude::encode(&mut buffer.borrow_mut().buf[..],
                                                             &redis_protocol::prelude::Frame::Array(Vec::new())).unwrap();
 
         return HandleResult::Processed((BufWrapView::filled_from_buf_wrap(buffer, bytes_written), consumed, false));
