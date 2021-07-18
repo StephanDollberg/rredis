@@ -160,8 +160,8 @@ impl Reactor {
                             println!("WARN: WAL is truncated");
                             return;
                         },
-                        HandleResult::Processed((_write_buf, bytes_consumed, _write_wal)) => {
-                            offset += bytes_consumed;
+                        HandleResult::Processed(result) => {
+                            offset += result.bytes_consumed;
                         },
                         HandleResult::Error => {
                             panic!("Got redis protocol error when reading WAL");
@@ -257,13 +257,14 @@ impl Reactor {
             HandleResult::NotEnoughData => {
                 self.enqueue_read(&mut sq, read_token_index, fd, context_index);
             },
-            HandleResult::Processed((write_buf, bytes_consumed, write_wal)) => {
-                if write_wal {
-                    self.handle_wal_write(&mut sq, self.context_alloc[context_index].read_buf.sub_read_buf(bytes_consumed));
+            HandleResult::Processed(result) => {
+                if result.write_wal {
+                    self.handle_wal_write(&mut sq,
+                                          self.context_alloc[context_index].read_buf.sub_read_buf(result.bytes_consumed));
                 }
 
-                self.context_alloc[context_index].read_buf.advance_read(bytes_consumed);
-                self.context_alloc[context_index].write_buf = Option::Some(write_buf.clone());
+                self.context_alloc[context_index].read_buf.advance_read(result.bytes_consumed);
+                self.context_alloc[context_index].write_buf = Option::Some(result.response_buf.clone());
 
                 self.enqueue_write(&mut sq, fd, self.context_alloc[context_index].write_token_index,
                                    context_index);

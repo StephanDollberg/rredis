@@ -4,10 +4,16 @@ use crate::reusable_slab_allocator::*;
 
 type CommandHandler = fn(&mut RedisHandler, &Vec<redis_protocol::prelude::Frame>, &mut BufferPoolAllocator, consumed: usize) -> HandleResult;
 
+pub struct ProcessedResult {
+    pub response_buf: BufWrapView,
+    pub bytes_consumed: usize,
+    pub write_wal: bool,
+}
+
 pub enum HandleResult {
     NotEnoughData,
     // buf_index to send, buf len, bytes consumed, write_wal, TODO make this a struct
-    Processed((BufWrapView, usize, bool)),
+    Processed(ProcessedResult),
     Error,
 }
 
@@ -40,7 +46,11 @@ impl RedisHandler {
             }
         };
 
-        return HandleResult::Processed((BufWrapView::filled_from_buf_wrap(buffer, bytes_written), consumed, false));
+        return HandleResult::Processed(ProcessedResult{
+            response_buf: BufWrapView::filled_from_buf_wrap(buffer, bytes_written),
+            bytes_consumed: consumed,
+            write_wal: false
+        });
     }
 
     pub fn handle_set(&mut self, args: &Vec<redis_protocol::prelude::Frame>, buf_alloc: &mut BufferPoolAllocator, consumed: usize) -> HandleResult {
@@ -65,7 +75,12 @@ impl RedisHandler {
         let bytes_written = redis_protocol::prelude::encode(&mut buffer.borrow_mut().buf[..],
                                                             &redis_protocol::prelude::Frame::SimpleString(String::from("OK"))).unwrap();
 
-        return HandleResult::Processed((BufWrapView::filled_from_buf_wrap(buffer, bytes_written), consumed, true));
+        return HandleResult::Processed(
+            ProcessedResult {
+                response_buf: BufWrapView::filled_from_buf_wrap(buffer, bytes_written),
+                bytes_consumed: consumed,
+                write_wal: true
+            });
     }
 
     pub fn handle_command(&mut self, _args: &Vec<redis_protocol::prelude::Frame>, buf_alloc: &mut BufferPoolAllocator, consumed: usize) -> HandleResult {
@@ -74,7 +89,12 @@ impl RedisHandler {
         let bytes_written = redis_protocol::prelude::encode(&mut buffer.borrow_mut().buf[..],
                                                             &redis_protocol::prelude::Frame::Array(Vec::new())).unwrap();
 
-        return HandleResult::Processed((BufWrapView::filled_from_buf_wrap(buffer, bytes_written), consumed, false));
+        return HandleResult::Processed(
+            ProcessedResult{
+                response_buf: BufWrapView::filled_from_buf_wrap(buffer, bytes_written),
+                bytes_consumed: consumed,
+                write_wal: false
+            });
     }
 
     pub fn new() -> RedisHandler {
@@ -163,11 +183,12 @@ mod tests {
             buffer.advance_write(set_data.len());
 
             match handler.handle_data_from_buf_wrap(&mut allocator, &buffer) {
-                HandleResult::Processed((write_buffer, bytes_consumed, _wal)) => {
-                    assert_eq!(bytes_consumed, set_data.len());
+                HandleResult::Processed(result) => {
+                    assert_eq!(result.bytes_consumed, set_data.len());
                     let ok_string = "+OK\r\n";
-                    assert_eq!(write_buffer.read_view().len(), ok_string.len());
-                    assert_eq!(*write_buffer.read_view(), *ok_string.as_bytes());
+                    assert_eq!(result.response_buf.read_view().len(), ok_string.len());
+                    assert_eq!(*result.response_buf.read_view(), *ok_string.as_bytes());
+                    assert_eq!(result.write_wal, true);
                 }
                 _ => {
                     assert!(false, "got wrong HandleResult");
@@ -182,11 +203,12 @@ mod tests {
             buffer.advance_write(get_data.len());
 
             match handler.handle_data_from_buf_wrap(&mut allocator, &buffer) {
-                HandleResult::Processed((write_buffer, bytes_consumed, _wal)) => {
-                    assert_eq!(bytes_consumed, get_data.len());
+                HandleResult::Processed(result) => {
+                    assert_eq!(result.bytes_consumed, get_data.len());
                     let resp_string = "$4\r\nyolo\r\n";
-                    assert_eq!(write_buffer.read_view().len(), resp_string.len());
-                    assert_eq!(*write_buffer.read_view(), *resp_string.as_bytes());
+                    assert_eq!(result.response_buf.read_view().len(), resp_string.len());
+                    assert_eq!(*result.response_buf.read_view(), *resp_string.as_bytes());
+                    assert_eq!(result.write_wal, false);
                 }
                 _ => {
                     assert!(false, "got wrong HandleResult");
