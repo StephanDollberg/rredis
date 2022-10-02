@@ -1,8 +1,11 @@
+use std::borrow::{Borrow};
 use std::collections::HashMap;
+use redis_protocol::resp2::prelude::*;
+use bytes::Bytes;
 
 use crate::reusable_slab_allocator::*;
 
-type CommandHandler = fn(&mut RedisHandler, &Vec<redis_protocol::prelude::Frame>, &mut BufferPoolAllocator, consumed: usize) -> HandleResult;
+type CommandHandler = fn(&mut RedisHandler, &Vec<Frame>, &mut BufferPoolAllocator, consumed: usize) -> HandleResult;
 
 pub struct ProcessedResult {
     pub response_buf: BufWrapView,
@@ -23,26 +26,26 @@ pub struct RedisHandler {
 }
 
 impl RedisHandler {
-    pub fn handle_get(&mut self, args: &Vec<redis_protocol::prelude::Frame>, buf_alloc: &mut BufferPoolAllocator, consumed: usize) -> HandleResult {
+    pub fn handle_get(&mut self, args: &Vec<Frame>, buf_alloc: &mut BufferPoolAllocator, consumed: usize) -> HandleResult {
         if args.len() < 2 {
             return HandleResult::Error;
         }
 
         let key = match &args[1] {
-            redis_protocol::prelude::Frame::BulkString(key) => key,
+            Frame::BulkString(key) => key,
             _ => return HandleResult::Error
         };
 
         let buffer = allocate_buf(buf_alloc.clone());
 
-        let bytes_written = match self.state.get(key) {
+        let bytes_written = match self.state.get(<bytes::Bytes as Borrow<[u8]>>::borrow(key)) {
             Some(val) => {
-                redis_protocol::prelude::encode(&mut buffer.borrow_mut().buf[..],
-                                                &redis_protocol::prelude::Frame::BulkString(val.clone())).unwrap()
+                encode(&mut buffer.as_ref().borrow_mut().buf, 0,
+                                                &Frame::BulkString(Bytes::from(val.clone()))).unwrap()
             }
             None => {
-                redis_protocol::prelude::encode(&mut buffer.borrow_mut().buf[..],
-                                                &redis_protocol::prelude::Frame::Null).unwrap()
+                encode(&mut buffer.as_ref().borrow_mut().buf, 0,
+                                                &Frame::Null).unwrap()
             }
         };
 
@@ -53,18 +56,18 @@ impl RedisHandler {
         });
     }
 
-    pub fn handle_set(&mut self, args: &Vec<redis_protocol::prelude::Frame>, buf_alloc: &mut BufferPoolAllocator, consumed: usize) -> HandleResult {
+    pub fn handle_set(&mut self, args: &Vec<Frame>, buf_alloc: &mut BufferPoolAllocator, consumed: usize) -> HandleResult {
         if args.len() < 3 {
             return HandleResult::Error;
         }
 
         let key = match &args[1] {
-            redis_protocol::prelude::Frame::BulkString(key) => key,
+            Frame::BulkString(key) => key,
             _ => return HandleResult::Error
         };
 
         let value = match &args[2] {
-            redis_protocol::prelude::Frame::BulkString(value) => value,
+            Frame::BulkString(value) => value,
             _ => return HandleResult::Error
         };
 
@@ -72,8 +75,8 @@ impl RedisHandler {
 
         let buffer = allocate_buf(buf_alloc.clone());
 
-        let bytes_written = redis_protocol::prelude::encode(&mut buffer.borrow_mut().buf[..],
-                                                            &redis_protocol::prelude::Frame::SimpleString(String::from("OK"))).unwrap();
+        let bytes_written = encode(&mut buffer.as_ref().borrow_mut().buf, 0,
+                                                            &Frame::SimpleString(Bytes::from("OK"))).unwrap();
 
         return HandleResult::Processed(
             ProcessedResult {
@@ -83,11 +86,11 @@ impl RedisHandler {
             });
     }
 
-    pub fn handle_command(&mut self, _args: &Vec<redis_protocol::prelude::Frame>, buf_alloc: &mut BufferPoolAllocator, consumed: usize) -> HandleResult {
+    pub fn handle_command(&mut self, _args: &Vec<Frame>, buf_alloc: &mut BufferPoolAllocator, consumed: usize) -> HandleResult {
         let buffer = allocate_buf(buf_alloc.clone());
 
-        let bytes_written = redis_protocol::prelude::encode(&mut buffer.borrow_mut().buf[..],
-                                                            &redis_protocol::prelude::Frame::Array(Vec::new())).unwrap();
+        let bytes_written = encode(&mut buffer.as_ref().borrow_mut().buf, 0,
+                                                            &Frame::Array(Vec::new())).unwrap();
 
         return HandleResult::Processed(
             ProcessedResult{
@@ -112,18 +115,18 @@ impl RedisHandler {
         return handler;
     }
 
-    fn handle_frame(&mut self, frame: &redis_protocol::prelude::Frame, mut buf_alloc: &mut BufferPoolAllocator, consumed: usize) -> HandleResult {
+    fn handle_frame(&mut self, frame: &Frame, mut buf_alloc: &mut BufferPoolAllocator, consumed: usize) -> HandleResult {
         match frame {
-            redis_protocol::prelude::Frame::Array(vec) => {
+            Frame::Array(vec) => {
                 let maybe_command = &vec[0];
                 match maybe_command {
-                    redis_protocol::prelude::Frame::BulkString(command) => {
+                    Frame::BulkString(command) => {
                         println!("command {:?}", std::str::from_utf8(command));
 
-                        let handler = self.command_handlers.get(command);
+                        let handler = self.command_handlers.get(<bytes::Bytes as Borrow<[u8]>>::borrow(command));
 
                         if handler.is_some() {
-                            return self.command_handlers[command](self, &vec, &mut buf_alloc, consumed);
+                            return self.command_handlers[<bytes::Bytes as Borrow<[u8]>>::borrow(command)](self, &vec, &mut buf_alloc, consumed);
                         }
 
                         return HandleResult::Error;
@@ -146,21 +149,22 @@ impl RedisHandler {
     }
 
     pub fn handle_data_from_slice(&mut self, mut buf_alloc: &mut BufferPoolAllocator, buffer: &[u8]) -> HandleResult {
-        match redis_protocol::prelude::decode(buffer) {
-            Ok((frame, consumed)) => {
-                match frame {
-                    Some(frame) => {
-                        return self.handle_frame(&frame, &mut buf_alloc, consumed);
+        let buf = bytes::Bytes::copy_from_slice(buffer);
+        return match decode(&buf) {
+            Ok(maybe_frame) => {
+                match maybe_frame {
+                    Some((frame, consumed)) => {
+                        self.handle_frame(&frame, &mut buf_alloc, consumed)
                     }
                     None => {
                         println!("Incomplete command, need more data...");
-                        return HandleResult::NotEnoughData;
+                        HandleResult::NotEnoughData
                     }
                 }
             }
             Err(e) => {
                 println!("Error parsing redis command: {:?}", e);
-                return HandleResult::Error;
+                HandleResult::Error
             }
         };
     }

@@ -1,3 +1,5 @@
+extern crate core;
+
 mod reactor;
 mod redis_handler;
 mod types;

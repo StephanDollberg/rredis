@@ -6,12 +6,13 @@ edition = "2018"
 
 
 [dependencies]
-io-uring = "0.5"
-redis-protocol = "1.0.0"
-anyhow = "1"
-nix = "0.19"
-lazy_static = "1"
-socket2 = "0.3"
-slab = "0.4"
-libc = { version = "0.2", default-features = false }
-tempfile = "3.2.0"
+io-uring = "*"
+redis-protocol = "*"
+anyhow = "*"
+nix = "*"
+lazy_static = "*"
+socket2 = "*"
+slab = "*"
+libc = { version = "*", default-features = false }
+tempfile = "*"
+bytes = "*"
